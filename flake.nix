@@ -36,17 +36,19 @@
               mkdir -p $out/bin $out/lib
               cp compiled/outline-editor.js $out/lib/outline-editor.js
 
-              # Expand the output path while installing, but leave the argument
-              # expansion for the generated launcher at runtime.
               cat > $out/bin/outline-editor <<EOF
               #!${pkgs.runtimeShell}
-              # Keep command-line parsing in the program so direct and packaged
-              # invocations show identical help and version output.
               exec ${pkgs.nodejs}/bin/node $out/lib/outline-editor.js "\$@"
               EOF
               chmod +x $out/bin/outline-editor
+              ln -s outline-editor $out/bin/outline
               runHook postInstall
             '';
+
+            meta = {
+              description = "Interactive direct-manipulation terminal outline editor for Markdown slides";
+              mainProgram = "outline-editor";
+            };
           };
         in
         {
