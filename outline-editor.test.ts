@@ -1,0 +1,666 @@
+import * as fs from "fs";
+import * as path from "path";
+import * as assert from "assert";
+import { OutlineEditorTUI, Outline } from "./outline-editor";
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function runTests() {
+  console.log("Starting test suite for Outline Editor...");
+  let passed = 0;
+  let failed = 0;
+
+  async function test(name: string, fn: () => void | Promise<void>) {
+    try {
+      await fn();
+      console.log(`  ✓ ${name}`);
+      passed++;
+    } catch (err) {
+      console.error(`  ✗ ${name}`);
+      console.error(err);
+      failed++;
+    }
+  }
+
+  const testFile = path.resolve("./test-tmp.md");
+  if (fs.existsSync(testFile)) fs.unlinkSync(testFile);
+
+  try {
+    // ----------------------------------------------------
+    // Test 1: Single-slot clipboard storage
+    // ----------------------------------------------------
+    await test("Single-slot clipboard stores and overwrites content", () => {
+      const editor = new OutlineEditorTUI(testFile);
+      assert.strictEqual(editor.getClipboard(), null);
+
+      editor.setClipboard({ text: "first text", isLinewise: false });
+      assert.deepStrictEqual(editor.getClipboard(), { text: "first text", isLinewise: false });
+
+      // Overwrite slot
+      editor.setClipboard({ text: "second text\n", isLinewise: true });
+      assert.deepStrictEqual(editor.getClipboard(), { text: "second text\n", isLinewise: true });
+      (editor as any).quit(true);
+    });
+
+    // ----------------------------------------------------
+    // Test 2: Characterwise Visual Mode (v) and Yank (y)
+    // ----------------------------------------------------
+    await test("Characterwise visual mode selection and yank in EDIT_NORMAL", () => {
+      const editor = new OutlineEditorTUI(testFile);
+      // Start editing title on Introduction (index 0)
+      editor.dispatchKey({ name: "e" });
+      assert.strictEqual(editor.getMode(), "EDIT_NORMAL");
+      assert.strictEqual(editor.getEditField(), "title");
+      assert.strictEqual(editor.getInput(), "Introduction");
+
+      // Move cursor to index 2 ("t")
+      editor.dispatchKey({ name: "0" });
+      editor.dispatchKey({ sequence: "l" });
+      editor.dispatchKey({ sequence: "l" });
+      assert.strictEqual(editor.getInputCursor(), 2);
+
+      // Enter characterwise visual mode
+      editor.dispatchKey({ sequence: "v" });
+      assert.strictEqual(editor.getMode(), "VISUAL");
+      assert.strictEqual(editor.getVisualType(), "char");
+      assert.strictEqual(editor.getVisualAnchor(), 2);
+
+      // Move cursor forward with 'e' (to end of word)
+      editor.dispatchKey({ sequence: "e" });
+      const cur = editor.getInputCursor();
+      assert.strictEqual(cur, 11); // end of "Introduction"
+
+      // Yank selection
+      editor.dispatchKey({ sequence: "y" });
+      assert.strictEqual(editor.getMode(), "EDIT_NORMAL");
+      const clip = editor.getClipboard();
+      assert.ok(clip);
+      assert.strictEqual(clip!.text, "troduction");
+      assert.strictEqual(clip!.isLinewise, false);
+      (editor as any).quit(true);
+    });
+
+    // ----------------------------------------------------
+    // Test 3: Visual mode Swap Anchor and Cursor (o)
+    // ----------------------------------------------------
+    await test("Visual mode swap ends with 'o'", () => {
+      const editor = new OutlineEditorTUI(testFile);
+      editor.dispatchKey({ name: "e" });
+      editor.dispatchKey({ name: "0" }); // cursor at 0
+      editor.dispatchKey({ sequence: "v" }); // anchor at 0
+      editor.dispatchKey({ sequence: "l" });
+      editor.dispatchKey({ sequence: "l" }); // cursor at 2
+      assert.strictEqual(editor.getVisualAnchor(), 0);
+      assert.strictEqual(editor.getInputCursor(), 2);
+
+      editor.dispatchKey({ sequence: "o" });
+      assert.strictEqual(editor.getVisualAnchor(), 2);
+      assert.strictEqual(editor.getInputCursor(), 0);
+      (editor as any).quit(true);
+    });
+
+    // ----------------------------------------------------
+    // Test 4: Visual Mode Cut (d/x) and Paste (p) in Title
+    // ----------------------------------------------------
+    await test("Visual mode cut (d) and paste (p)", () => {
+      const editor = new OutlineEditorTUI(testFile);
+      editor.dispatchKey({ name: "e" });
+      editor.dispatchKey({ name: "0" });
+      // Select first 5 chars: "Intro"
+      editor.dispatchKey({ sequence: "v" });
+      for (let i = 0; i < 4; i++) editor.dispatchKey({ sequence: "l" });
+      assert.strictEqual(editor.getInputCursor(), 4);
+
+      // Cut selection
+      editor.dispatchKey({ sequence: "d" });
+      assert.strictEqual(editor.getMode(), "EDIT_NORMAL");
+      assert.strictEqual(editor.getInput(), "duction");
+      assert.strictEqual(editor.getClipboard()?.text, "Intro");
+
+      // Paste it back
+      editor.dispatchKey({ sequence: "p" });
+      assert.strictEqual(editor.getInput(), "dIntrouction");
+
+      // Undo paste
+      editor.dispatchKey({ sequence: "u" });
+      assert.strictEqual(editor.getInput(), "duction");
+
+      // Undo cut
+      editor.dispatchKey({ sequence: "u" });
+      assert.strictEqual(editor.getInput(), "Introduction");
+      (editor as any).quit(true);
+    });
+
+    // ----------------------------------------------------
+    // Test 5: Operator yank (yw, yy) in EDIT_NORMAL
+    // ----------------------------------------------------
+    await test("Operator yanks (yw, yy, Y) in EDIT_NORMAL", () => {
+      const editor = new OutlineEditorTUI(testFile);
+      editor.dispatchKey({ name: "e" });
+      editor.dispatchKey({ name: "0" });
+
+      // yy yanks current line
+      editor.dispatchKey({ sequence: "y" });
+      editor.dispatchKey({ sequence: "y" });
+      assert.deepStrictEqual(editor.getClipboard(), { text: "Introduction\n", isLinewise: true });
+
+      // Y also yanks line
+      editor.dispatchKey({ sequence: "Y" });
+      assert.deepStrictEqual(editor.getClipboard(), { text: "Introduction\n", isLinewise: true });
+
+      // yw yanks word
+      editor.dispatchKey({ sequence: "y" });
+      editor.dispatchKey({ sequence: "w" });
+      assert.strictEqual(editor.getClipboard()?.text, "Introduction");
+      assert.strictEqual(editor.getClipboard()?.isLinewise, false);
+      (editor as any).quit(true);
+    });
+
+    // ----------------------------------------------------
+    // Test 6: Cross-pane copy/paste (Description -> Title -> Notes -> Outline Node)
+    // ----------------------------------------------------
+    await test("Cross-pane copy/paste across every pane", () => {
+      const editor = new OutlineEditorTUI(testFile);
+      // 1. Enter Description pane on node 0
+      editor.dispatchKey({ sequence: "E" });
+      // Type some description:
+      editor.dispatchKey({ sequence: "F" });
+      editor.dispatchKey({ sequence: "i" });
+      editor.dispatchKey({ sequence: "r" });
+      editor.dispatchKey({ sequence: "s" });
+      editor.dispatchKey({ sequence: "t" });
+      editor.dispatchKey({ name: "escape" }); // to EDIT_NORMAL
+      assert.strictEqual(editor.getMode(), "EDIT_NORMAL");
+      assert.strictEqual(editor.getEditField(), "description");
+      assert.strictEqual(editor.getInput(), "First");
+
+      // Select "First" and yank it
+      editor.dispatchKey({ name: "0" });
+      editor.dispatchKey({ sequence: "v" });
+      editor.dispatchKey({ sequence: "e" });
+      editor.dispatchKey({ sequence: "y" });
+      assert.strictEqual(editor.getClipboard()?.text, "First");
+
+      // 2. Switch to Notes pane with Tab
+      editor.dispatchKey({ name: "tab" });
+      assert.strictEqual(editor.getEditField(), "notes");
+      // Paste clipboard into Notes
+      editor.dispatchKey({ sequence: "p" });
+      assert.strictEqual(editor.getInput(), "First");
+
+      // 3. Switch to Title pane with Tab
+      editor.dispatchKey({ name: "tab" });
+      assert.strictEqual(editor.getEditField(), "title");
+      // Append paste into title
+      editor.dispatchKey({ name: "end" });
+      editor.dispatchKey({ sequence: "p" });
+      assert.strictEqual(editor.getInput(), "IntroductionFirst");
+
+      // 4. Return to NORMAL mode and paste as new Outline Node
+      editor.dispatchKey({ name: "escape" });
+      assert.strictEqual(editor.getMode(), "NORMAL");
+      editor.dispatchKey({ sequence: "p" }); // paste as sibling below
+      const sel = (editor as any).selectedNode;
+      assert.strictEqual(sel.title, "First");
+      (editor as any).quit(true);
+    });
+
+    // ----------------------------------------------------
+    // Test 7: NORMAL mode visual selection and yank/paste
+    // ----------------------------------------------------
+    await test("NORMAL mode v opens title visual selection, yy yanks node title", () => {
+      const editor = new OutlineEditorTUI(testFile);
+      // On node 0 ("Introduction"), press 'v'
+      editor.dispatchKey({ sequence: "v" });
+      assert.strictEqual(editor.getMode(), "VISUAL");
+      assert.strictEqual(editor.getEditField(), "title");
+
+      // Cancel visual
+      editor.dispatchKey({ name: "escape" });
+      assert.strictEqual(editor.getMode(), "EDIT_NORMAL");
+      editor.dispatchKey({ name: "escape" });
+      assert.strictEqual(editor.getMode(), "NORMAL");
+
+      // Test yy in NORMAL mode
+      editor.dispatchKey({ sequence: "y" });
+      editor.dispatchKey({ sequence: "y" });
+      assert.strictEqual(editor.getClipboard()?.text, "Introduction");
+      assert.strictEqual(editor.getClipboard()?.isLinewise, true);
+      (editor as any).quit(true);
+    });
+
+    // ----------------------------------------------------
+    // Test 8: Linewise Visual Mode (V) in multiline field
+    // ----------------------------------------------------
+    await test("Linewise visual mode (V) selects and cuts full lines", () => {
+      const editor = new OutlineEditorTUI(testFile);
+      (editor as any).selectedNode.description = "Line 1\nLine 2\nLine 3";
+      editor.dispatchKey({ sequence: "E" });
+      assert.strictEqual(editor.getMode(), "EDIT_NORMAL");
+      assert.strictEqual(editor.getEditField(), "description");
+
+      // Move down to Line 2
+      editor.dispatchKey({ sequence: "j" });
+      editor.dispatchKey({ sequence: "V" });
+      assert.strictEqual(editor.getMode(), "VISUAL");
+      assert.strictEqual(editor.getVisualType(), "line");
+
+      // Yank line 2
+      editor.dispatchKey({ sequence: "y" });
+      assert.strictEqual(editor.getMode(), "EDIT_NORMAL");
+      assert.strictEqual(editor.getClipboard()?.text, "Line 2\n");
+      assert.strictEqual(editor.getClipboard()?.isLinewise, true);
+      (editor as any).quit(true);
+    });
+
+    // ----------------------------------------------------
+    // Test 9: Filesystem Auto-Reload when not modified
+    // ----------------------------------------------------
+    await test("Auto-reload from disk when !this.modified", async () => {
+      const testMd = path.resolve("./auto-reload-test.md");
+      fs.writeFileSync(testMd, "# Slide One\n\nContent one\n\n---\n\n# Slide Two\n", "utf8");
+
+      const editor = new OutlineEditorTUI(testMd);
+      assert.strictEqual(editor.isModified(), false);
+      const initialCount = editor.getOutline().getVisibleNodes().length;
+      assert.strictEqual(initialCount, 2);
+
+      // Externally modify file
+      await sleep(100);
+      fs.writeFileSync(testMd, "# Slide One\n\nContent one\n\n---\n\n# Slide Two\n\n---\n\n# Slide Three\n", "utf8");
+
+      // Wait for debounce and reload
+      await sleep(250);
+
+      const newCount = editor.getOutline().getVisibleNodes().length;
+      assert.strictEqual(newCount, 3);
+      assert.strictEqual(editor.getOutline().getVisibleNodes()[2].title, "Slide Three");
+
+      (editor as any).quit(true);
+      if (fs.existsSync(testMd)) fs.unlinkSync(testMd);
+    });
+
+    // ----------------------------------------------------
+    // Test 10: Save conflict warning when modified on disk
+    // ----------------------------------------------------
+    await test("Save conflict guard prevents overwrite and force save works", async () => {
+      const testMd = path.resolve("./conflict-test.md");
+      fs.writeFileSync(testMd, "# Initial Slide\n", "utf8");
+
+      const editor = new OutlineEditorTUI(testMd);
+      // Make local modification in editor
+      editor.dispatchKey({ name: "e" });
+      (editor as any).input = "Locally Modified";
+      editor.dispatchKey({ name: "return" });
+      assert.strictEqual(editor.isModified(), true);
+      assert.strictEqual(editor.getMode(), "NORMAL");
+
+      // Externally modify file on disk
+      await sleep(100);
+      fs.writeFileSync(testMd, "# External Modification\n", "utf8");
+      await sleep(250);
+
+      // Check conflict detected
+      assert.strictEqual(editor.isDiskFileModified(), true);
+
+      // Attempt regular save via :w
+      editor.dispatchKey({ sequence: ":" });
+      for (const ch of "w") editor.dispatchKey({ sequence: ch });
+      editor.dispatchKey({ name: "return" });
+
+      // Save should be blocked with conflict message!
+      assert.ok(editor.getStatusMessage().includes("Conflict"));
+      assert.strictEqual(editor.isModified(), true);
+      // File on disk must NOT have been overwritten
+      assert.strictEqual(fs.readFileSync(testMd, "utf8"), "# External Modification\n");
+
+      // Force save with :w!
+      editor.dispatchKey({ sequence: ":" });
+      for (const ch of "w!") editor.dispatchKey({ sequence: ch });
+      editor.dispatchKey({ name: "return" });
+
+      // Force save should succeed
+      assert.strictEqual(editor.isModified(), false);
+      assert.strictEqual(editor.isDiskFileModified(), false);
+      assert.ok(editor.getStatusMessage().includes("Saved"));
+      assert.ok(fs.readFileSync(testMd, "utf8").includes("Locally Modified"));
+
+      (editor as any).quit(true);
+      if (fs.existsSync(testMd)) fs.unlinkSync(testMd);
+    });
+
+    // ----------------------------------------------------
+    // Test 11: Force reload with :e!
+    // ----------------------------------------------------
+    await test("Force reload with :e! discards local changes", async () => {
+      const testMd = path.resolve("./reload-force-test.md");
+      fs.writeFileSync(testMd, "# Disk Version\n", "utf8");
+
+      const editor = new OutlineEditorTUI(testMd);
+      editor.dispatchKey({ name: "e" });
+      (editor as any).input = "Unsaved Local Version";
+      editor.dispatchKey({ name: "return" });
+      assert.strictEqual(editor.isModified(), true);
+      assert.strictEqual(editor.getMode(), "NORMAL");
+
+      // Regular :e without ! should fail
+      editor.dispatchKey({ sequence: ":" });
+      for (const ch of "e") editor.dispatchKey({ sequence: ch });
+      editor.dispatchKey({ name: "return" });
+      assert.ok(editor.getStatusMessage().includes("Unsaved changes"));
+
+      // Force :e! should succeed and reload disk version
+      editor.dispatchKey({ sequence: ":" });
+      for (const ch of "e!") editor.dispatchKey({ sequence: ch });
+      editor.dispatchKey({ name: "return" });
+      assert.strictEqual(editor.isModified(), false);
+      assert.strictEqual(editor.getOutline().getVisibleNodes()[0].title, "Disk Version");
+
+      (editor as any).quit(true);
+      if (fs.existsSync(testMd)) fs.unlinkSync(testMd);
+    });
+
+    // ----------------------------------------------------
+    // Keys are asserted with the sequences a terminal really sends:
+    // readline delivers Tab as "\t" and Right as "\x1b[C", never as the
+    // key name, so a dispatcher matched on `sequence || name` looks fine
+    // under name-only input and is unreachable from a keyboard.
+    // ----------------------------------------------------
+    const TAB = { name: "tab", sequence: "\t" };
+    const STAB = { name: "tab", sequence: "\x1b[Z", shift: true };
+    const RIGHT = { name: "right", sequence: "\x1b[C" };
+    const ESC = { name: "escape", sequence: "\x1b" };
+
+    await test("Tab and Shift+Tab cycle panes from real terminal sequences", () => {
+      const editor = new OutlineEditorTUI(testFile);
+      editor.dispatchKey({ name: "e" });
+      assert.strictEqual(editor.getEditField(), "title");
+
+      editor.dispatchKey(TAB);
+      assert.strictEqual(editor.getEditField(), "description");
+      editor.dispatchKey(TAB);
+      assert.strictEqual(editor.getEditField(), "notes");
+      editor.dispatchKey(TAB);
+      assert.strictEqual(editor.getEditField(), "title");
+
+      editor.dispatchKey(STAB);
+      assert.strictEqual(editor.getEditField(), "notes");
+
+      // Tab must reach the pane switch from VISUAL too.
+      editor.dispatchKey({ sequence: "v" });
+      assert.strictEqual(editor.getMode(), "VISUAL");
+      editor.dispatchKey(TAB);
+      assert.strictEqual(editor.getEditField(), "title");
+      assert.strictEqual(editor.getMode(), "EDIT_NORMAL");
+      (editor as any).quit(true);
+    });
+
+    await test("Arrow keys move the cursor in EDIT-NAV", () => {
+      const editor = new OutlineEditorTUI(testFile);
+      editor.dispatchKey({ name: "e" });
+      editor.dispatchKey({ sequence: "0" });
+      assert.strictEqual(editor.getInputCursor(), 0);
+      editor.dispatchKey(RIGHT);
+      assert.strictEqual(editor.getInputCursor(), 1);
+      (editor as any).quit(true);
+    });
+
+    await test("gg extends a visual selection to the start of the field", () => {
+      const editor = new OutlineEditorTUI(testFile);
+      editor.dispatchKey({ sequence: "E" });
+      editor.dispatchKey({ name: "i" });
+      for (const ch of "one") editor.dispatchKey({ sequence: ch });
+      editor.dispatchKey({ name: "return" });
+      for (const ch of "two") editor.dispatchKey({ sequence: ch });
+      editor.dispatchKey(ESC);
+      assert.strictEqual(editor.getMode(), "EDIT_NORMAL");
+
+      editor.dispatchKey({ sequence: "v" });
+      assert.ok(editor.getInputCursor() > 0);
+      editor.dispatchKey({ sequence: "g" });
+      editor.dispatchKey({ sequence: "g" });
+      assert.strictEqual(editor.getInputCursor(), 0);
+
+      // A lone g followed by something else is dropped, not treated as gg.
+      editor.dispatchKey({ sequence: "G" });
+      const atEnd = editor.getInputCursor();
+      editor.dispatchKey({ sequence: "g" });
+      editor.dispatchKey({ sequence: "l" });
+      assert.strictEqual(editor.getInputCursor(), atEnd);
+      (editor as any).quit(true);
+    });
+
+    await test("Opening a node for editing without changing it stays clean", () => {
+      const editor = new OutlineEditorTUI(testFile);
+      assert.strictEqual(editor.isModified(), false);
+
+      editor.dispatchKey({ name: "e" });
+      assert.strictEqual(editor.isModified(), false, "opening a title is not an edit");
+      editor.dispatchKey(ESC);
+      assert.strictEqual(editor.isModified(), false, "e then Esc changed nothing");
+
+      // Folding only touches `collapsed`, which is not persisted.
+      editor.dispatchKey({ name: "h" });
+      assert.strictEqual(editor.isModified(), false, "folding is not an edit");
+
+      // Actually typing does mark it dirty, and so does an uncommitted buffer.
+      editor.dispatchKey({ name: "e" });
+      editor.dispatchKey({ name: "i" });
+      editor.dispatchKey({ sequence: "X" });
+      assert.strictEqual(editor.isModified(), true);
+      (editor as any).quit(true);
+    });
+
+    await test("Auto-reload keeps the selection on the same node, not the same slot", async () => {
+      const md = path.resolve("./test-anchor.md");
+      fs.writeFileSync(md, "# Alpha\n\n# Beta\n\n# Gamma\n");
+      const editor = new OutlineEditorTUI(md);
+      editor.dispatchKey({ name: "j" });
+      editor.dispatchKey({ name: "j" });
+      assert.strictEqual(editor.getOutline().getVisibleNodes()[editor.getCurrentIndex()].title, "Gamma");
+
+      // A heading inserted above shifts every positional id down by one.
+      fs.writeFileSync(md, "# NEW\n\n# Alpha\n\n# Beta\n\n# Gamma\n");
+      await sleep(300);
+
+      assert.ok(editor.getStatusMessage().includes("Auto-reloaded"));
+      assert.strictEqual(
+        editor.getOutline().getVisibleNodes()[editor.getCurrentIndex()].title,
+        "Gamma",
+        "selection followed the node, not the id"
+      );
+      (editor as any).quit(true);
+      if (fs.existsSync(md)) fs.unlinkSync(md);
+    });
+
+    await test("Undo after an auto-reload cannot discard the external change", async () => {
+      const md = path.resolve("./test-undo-reload.md");
+      fs.writeFileSync(md, "# Alpha\n");
+      const editor = new OutlineEditorTUI(md);
+
+      editor.dispatchKey({ sequence: "o" });
+      for (const ch of "Mine") editor.dispatchKey({ sequence: ch });
+      editor.dispatchKey({ name: "return" });
+      (editor as any).saveFile();
+      assert.strictEqual(editor.isModified(), false);
+      await sleep(120);
+
+      fs.writeFileSync(md, "# Alpha\n\n# Mine\n\n# From Colleague\n");
+      await sleep(300);
+      const afterReload = editor.getOutline().root.children.map((n: any) => n.title);
+      assert.deepStrictEqual(afterReload, ["Alpha", "Mine", "From Colleague"]);
+
+      // The pre-reload snapshots are gone, so u cannot jump the boundary.
+      editor.dispatchKey({ sequence: "u" });
+      assert.deepStrictEqual(
+        editor.getOutline().root.children.map((n: any) => n.title),
+        ["Alpha", "Mine", "From Colleague"]
+      );
+      assert.strictEqual(editor.isModified(), false);
+      (editor as any).quit(true);
+      if (fs.existsSync(md)) fs.unlinkSync(md);
+    });
+
+    await test("A reload arriving mid-edit is deferred, then applied on return to NORMAL", async () => {
+      const md = path.resolve("./test-deferred.md");
+      fs.writeFileSync(md, "# Alpha\n\n# Beta\n");
+      const editor = new OutlineEditorTUI(md);
+
+      editor.dispatchKey({ name: "e" });
+      assert.strictEqual(editor.getMode(), "EDIT_NORMAL");
+
+      fs.writeFileSync(md, "# Alpha CHANGED\n\n# Beta\n");
+      await sleep(300);
+
+      assert.ok(editor.getStatusMessage().includes("when you leave edit mode"));
+      assert.strictEqual(
+        editor.getOutline().root.children[0].title,
+        "Alpha",
+        "the buffer must not be swapped out mid-edit"
+      );
+
+      editor.dispatchKey(ESC);
+      assert.strictEqual(editor.getMode(), "NORMAL");
+      assert.strictEqual(editor.getOutline().root.children[0].title, "Alpha CHANGED");
+      assert.strictEqual(editor.isModified(), false);
+      (editor as any).quit(true);
+      if (fs.existsSync(md)) fs.unlinkSync(md);
+    });
+
+    await test("A deferred reload degrades into the conflict guard when the buffer is dirtied", async () => {
+      const md = path.resolve("./test-deferred-dirty.md");
+      fs.writeFileSync(md, "# Alpha\n");
+      const editor = new OutlineEditorTUI(md);
+
+      editor.dispatchKey({ name: "e" });
+      fs.writeFileSync(md, "# Disk Version\n");
+      await sleep(300);
+
+      // Typing after the deferral means the reload can no longer be applied.
+      editor.dispatchKey({ name: "i" });
+      for (const ch of "XY") editor.dispatchKey({ sequence: ch });
+      editor.dispatchKey(ESC);
+      editor.dispatchKey(ESC);
+
+      assert.strictEqual(editor.isDiskFileModified(), true, "must not drop the conflict silently");
+      (editor as any).executeCommand(":w");
+      assert.ok(editor.getStatusMessage().includes("Conflict"));
+      assert.strictEqual(fs.readFileSync(md, "utf8"), "# Disk Version\n", "disk left untouched");
+      (editor as any).quit(true);
+      if (fs.existsSync(md)) fs.unlinkSync(md);
+    });
+
+    await test("Linewise paste into a single-line field appends whole, without a stray space", () => {
+      const md = path.resolve("./test-linewise-paste.md");
+      fs.writeFileSync(md, "# Hello brave world\n");
+      const editor = new OutlineEditorTUI(md);
+
+      editor.dispatchKey({ name: "e" });
+      editor.dispatchKey({ sequence: "0" });
+      editor.dispatchKey({ sequence: "y" });
+      editor.dispatchKey({ sequence: "y" });
+      assert.deepStrictEqual(editor.getClipboard(), { text: "Hello brave world\n", isLinewise: true });
+
+      // The cursor sits mid-field, but a linewise register goes to the end.
+      editor.dispatchKey({ sequence: "l" });
+      editor.dispatchKey({ sequence: "p" });
+      assert.strictEqual(editor.getInput(), "Hello brave world Hello brave world");
+
+      // P puts it at the head instead.
+      const editor2 = new OutlineEditorTUI(md);
+      editor2.dispatchKey({ name: "e" });
+      editor2.setClipboard({ text: "Prefix\n", isLinewise: true });
+      editor2.dispatchKey({ sequence: "P" });
+      assert.strictEqual(editor2.getInput(), "Prefix Hello brave world");
+      (editor as any).quit(true);
+      (editor2 as any).quit(true);
+      if (fs.existsSync(md)) fs.unlinkSync(md);
+    });
+
+    await test("v on an empty outline does not enter VISUAL", () => {
+      const md = path.resolve("./test-empty.md");
+      fs.writeFileSync(md, "# Only\n");
+      const editor = new OutlineEditorTUI(md);
+
+      editor.dispatchKey({ sequence: "d" });
+      assert.strictEqual(editor.getOutline().getVisibleNodes().length, 0);
+
+      editor.dispatchKey({ sequence: "v" });
+      assert.strictEqual(editor.getMode(), "NORMAL");
+      editor.dispatchKey({ sequence: "V" });
+      assert.strictEqual(editor.getMode(), "NORMAL");
+      (editor as any).quit(true);
+      if (fs.existsSync(md)) fs.unlinkSync(md);
+    });
+
+    await test("Help overlay scrolls and closes on ?", () => {
+      const editor = new OutlineEditorTUI(testFile);
+      const anyEd = editor as any;
+
+      editor.dispatchKey({ sequence: "?" });
+      assert.strictEqual(anyEd.showHelpOverlay, true);
+      assert.strictEqual(anyEd.helpScroll, 0);
+
+      editor.dispatchKey({ sequence: "j" });
+      editor.dispatchKey({ sequence: "j" });
+      assert.strictEqual(anyEd.helpScroll, 2, "j scrolls the overlay, not the outline");
+      assert.strictEqual(editor.getCurrentIndex(), 0, "keys must not leak to the tree");
+
+      editor.dispatchKey({ sequence: "k" });
+      assert.strictEqual(anyEd.helpScroll, 1);
+
+      // Scrolling is clamped to the content, not left unbounded.
+      editor.dispatchKey({ sequence: "G" });
+      const bottom = anyEd.helpScroll;
+      assert.ok(bottom > 0 && bottom < 1000);
+      editor.dispatchKey({ sequence: "j" });
+      assert.strictEqual(anyEd.helpScroll, bottom, "cannot scroll past the end");
+
+      // `?` arrives as a sequence with no key name, so it has to match on that.
+      editor.dispatchKey({ sequence: "?" });
+      assert.strictEqual(anyEd.showHelpOverlay, false);
+      assert.strictEqual(anyEd.helpScroll, 0);
+      (editor as any).quit(true);
+    });
+
+    await test("External deletion is reported even over a clean buffer", async () => {
+      const md = path.resolve("./test-deleted.md");
+      fs.writeFileSync(md, "# Alpha\n");
+      const editor = new OutlineEditorTUI(md);
+      assert.strictEqual(editor.isModified(), false);
+
+      fs.unlinkSync(md);
+      await sleep(300);
+      assert.ok(editor.getStatusMessage().includes("deleted externally"));
+      (editor as any).quit(true);
+      if (fs.existsSync(md)) fs.unlinkSync(md);
+    });
+
+  } finally {
+    // A test that throws skips its own unlink, so sweep them all here rather
+    // than leaving scratch files behind in the working directory.
+    for (const name of [
+      testFile,
+      "./test-anchor.md",
+      "./test-undo-reload.md",
+      "./test-deferred.md",
+      "./test-deferred-dirty.md",
+      "./test-linewise-paste.md",
+      "./test-empty.md",
+      "./test-deleted.md",
+    ]) {
+      const resolved = path.resolve(name);
+      if (fs.existsSync(resolved)) fs.unlinkSync(resolved);
+    }
+  }
+
+  console.log(`\nTest results: ${passed} passed, ${failed} failed.`);
+  if (failed > 0) process.exit(1);
+}
+
+runTests().catch((err) => {
+  console.error("Unhandled error:", err);
+  process.exit(1);
+});
