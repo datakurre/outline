@@ -1,6 +1,7 @@
 import * as fs from "fs";
 import * as path from "path";
 import * as readline from "readline";
+import { spawnSync } from "child_process";
 
 // Core data model
 export interface OutlineNode {
@@ -19,6 +20,14 @@ const NOTES_OPEN = "::: notes";
 const NOTES_CLOSE = ":::";
 const NOTES_OPEN_RE = /^\s*:{3,}\s*(?:notes|\{\s*\.notes\s*\})\s*$/i;
 const NOTES_CLOSE_RE = /^\s*:{3,}\s*$/;
+
+// A fenced code block's contents are opaque: a `#`-comment, a bare `---`, or
+// a `::: notes` line inside one must never be mistaken for slide structure.
+const FENCE_RE = /^\s*(`{3,}|~{3,})/;
+
+// ATX heading; shared with the live-highlighting in computeMarkdownStyles so
+// the editor flags exactly what fromMarkdown will actually split on.
+const HEADING_RE = /^(#{1,6})[ \t]+(.+?)\s*#*\s*$/;
 
 export class Outline {
   root: OutlineNode;
@@ -257,6 +266,14 @@ export class Outline {
     // so hold them back rather than writing trailing whitespace into a node.
     let pendingBlanks = 0;
     let notesLines: string[] | null = null;
+    let inFence = false;
+
+    const appendToDescription = (raw: string) => {
+      if (!lastNode) return;
+      lastNode.description +=
+        (lastNode.description ? "\n".repeat(pendingBlanks + 1) : "") + raw;
+      pendingBlanks = 0;
+    };
 
     for (let i = lineIdx; i < allLines.length; i++) {
       const rawLine = allLines[i];
@@ -271,7 +288,22 @@ export class Outline {
         continue;
       }
 
-      const heading = rawLine.match(/^(#{1,6})[ \t]+(.+?)\s*#*\s*$/);
+      if (FENCE_RE.test(rawLine)) {
+        inFence = !inFence;
+        appendToDescription(rawLine);
+        continue;
+      }
+
+      if (inFence) {
+        if (lastNode && !rawLine.trim()) {
+          if (lastNode.description) pendingBlanks++;
+        } else {
+          appendToDescription(rawLine);
+        }
+        continue;
+      }
+
+      const heading = rawLine.match(HEADING_RE);
       if (heading) {
         const level = heading[1].length;
         const node: OutlineNode = {
@@ -296,9 +328,7 @@ export class Outline {
       } else if (lastNode && !rawLine.trim()) {
         if (lastNode.description) pendingBlanks++;
       } else if (lastNode) {
-        lastNode.description +=
-          (lastNode.description ? "\n".repeat(pendingBlanks + 1) : "") + rawLine;
-        pendingBlanks = 0;
+        appendToDescription(rawLine);
       }
     }
 
@@ -464,6 +494,141 @@ function wrapLineSegments(
   }
 }
 
+// ANSI styles used by the lightweight markdown highlighter below. Reused
+// as-is (no blending) — each character gets at most one style.
+export const MD_CAUTION = "\x1b[33m";
+export const MD_STRUCTURE = "\x1b[1m";
+export const MD_DIM = "\x1b[2m";
+export const MD_CODE = "\x1b[36m";
+export const MD_BOLD = "\x1b[1m";
+export const MD_ITALIC = "\x1b[3m";
+
+/**
+ * Per-character ANSI style codes for one field's lines, used by
+ * `renderTextBlock` to lightly highlight markdown syntax without touching
+ * the underlying text (styling is purely an output-composition step).
+ *
+ * `trackStructure` is true for the description field, where `fromMarkdown`
+ * treats a heading line, a bare `---`, or a `::: notes` line as document
+ * structure — but only *outside* a fenced code block, which it now (see
+ * `FENCE_RE`) treats as inert. Those still-live ambiguities are flagged in
+ * caution color so the risk is visible while typing, not just on reload.
+ * Notes content never splits on any of that — only a bare `:::` line closes
+ * the div early — so `trackStructure` is false there and fence markers are
+ * rendered as ordinary text.
+ */
+export function computeMarkdownStyles(lines: string[], trackStructure: boolean): string[][] {
+  const kind: Array<"fence-delim" | "fence-content" | "normal"> = [];
+  if (trackStructure) {
+    let inFence = false;
+    for (const line of lines) {
+      if (FENCE_RE.test(line)) {
+        kind.push("fence-delim");
+        inFence = !inFence;
+      } else {
+        kind.push(inFence ? "fence-content" : "normal");
+      }
+    }
+  } else {
+    for (const _line of lines) kind.push("normal");
+  }
+
+  return lines.map((line, i) => {
+    const styles = new Array<string>(line.length).fill("");
+    const mark = (start: number, end: number, style: string) => {
+      for (let c = Math.max(0, start); c < end && c < styles.length; c++) styles[c] = style;
+    };
+
+    if (kind[i] === "fence-delim") {
+      mark(0, line.length, MD_STRUCTURE);
+      return styles;
+    }
+    if (kind[i] === "fence-content") {
+      return styles;
+    }
+
+    if (NOTES_CLOSE_RE.test(line)) {
+      mark(0, line.length, trackStructure ? MD_CAUTION : MD_STRUCTURE);
+      return styles;
+    }
+    if (trackStructure && (HEADING_RE.test(line) || line.trim() === "---" || NOTES_OPEN_RE.test(line))) {
+      mark(0, line.length, MD_CAUTION);
+      return styles;
+    }
+
+    // Manual regex.exec loops, not matchAll()/for-of: this project's
+    // documented test-build command compiles without an explicit --target,
+    // so tsc downlevels for-of to array-style indexing that silently never
+    // runs over a bare iterator (no .length). exec-loops compile safely at
+    // any target, matching the pattern truncateToWidth already uses above.
+    let m: RegExpExecArray | null;
+
+    const codeRe = /`([^`]+)`/g;
+    while ((m = codeRe.exec(line)) !== null) {
+      const s = m.index;
+      mark(s, s + 1, MD_DIM);
+      mark(s + 1, s + 1 + m[1].length, MD_CODE);
+      mark(s + 1 + m[1].length, s + m[0].length, MD_DIM);
+    }
+    const boldRe = /(\*\*|__)(.+?)\1/g;
+    while ((m = boldRe.exec(line)) !== null) {
+      const s = m.index;
+      mark(s, s + 2, MD_DIM);
+      mark(s + 2, s + 2 + m[2].length, MD_BOLD);
+      mark(s + 2 + m[2].length, s + m[0].length, MD_DIM);
+    }
+    const italicRe = /(?<!\*)\*([^*\n]+)\*(?!\*)|(?<!_)_([^_\n]+)_(?!_)/g;
+    while ((m = italicRe.exec(line)) !== null) {
+      const s = m.index;
+      const inner = (m[1] ?? m[2] ?? "").length;
+      mark(s, s + 1, MD_DIM);
+      mark(s + 1, s + 1 + inner, MD_ITALIC);
+      mark(s + 1 + inner, s + m[0].length, MD_DIM);
+    }
+    const linkRe = /(!?\[)([^\]]*)(\]\()([^)]*)(\))/g;
+    while ((m = linkRe.exec(line)) !== null) {
+      let pos = m.index;
+      mark(pos, pos + m[1].length, MD_DIM);
+      pos += m[1].length + m[2].length;
+      mark(pos, pos + m[3].length, MD_DIM);
+      pos += m[3].length + m[4].length;
+      mark(pos, pos + m[5].length, MD_DIM);
+    }
+    const blockquote = line.match(/^(\s*>+\s?)/);
+    if (blockquote) mark(0, blockquote[1].length, MD_DIM);
+    const listMarker = line.match(/^(\s*)([-*+]|\d+\.)(\s+)/);
+    if (listMarker) mark(listMarker[1].length, listMarker[1].length + listMarker[2].length, MD_DIM);
+    if (line.includes("|")) {
+      for (let c = 0; c < line.length; c++) {
+        if (line[c] === "|") styles[c] = MD_DIM;
+      }
+    }
+
+    return styles;
+  });
+}
+
+/**
+ * Apply per-character style codes to plain text, coalescing consecutive
+ * identical styles into a single escape/reset pair rather than wrapping
+ * every character individually.
+ */
+function applyLineStyles(text: string, styles: string[]): string {
+  let out = "";
+  let openStyle: string | null = null;
+  for (let i = 0; i < text.length; i++) {
+    const style = styles[i] || null;
+    if (style !== openStyle) {
+      if (openStyle !== null) out += "\x1b[0m";
+      if (style !== null) out += style;
+      openStyle = style;
+    }
+    out += text[i];
+  }
+  if (openStyle !== null) out += "\x1b[0m";
+  return out;
+}
+
 function getCursorLineInfo(text: string, index: number) {
   const clamped = Math.max(0, Math.min(index, text.length));
   const before = text.slice(0, clamped);
@@ -505,7 +670,8 @@ export class OutlineEditorTUI {
   // "VISUAL" (characterwise or linewise visual selection)
   // "INSERT" (typing changes)
   // "COMMAND" (ex commands :w, :q, etc.)
-  private mode: "NORMAL" | "EDIT_NORMAL" | "VISUAL" | "INSERT" | "COMMAND" = "NORMAL";
+  private mode: "NORMAL" | "EDIT_NORMAL" | "VISUAL" | "INSERT" | "COMMAND" | "SHELL" = "NORMAL";
+  private shellResumeIsTTY: boolean = false;
   private visualType: "char" | "line" = "char";
   private visualAnchor: number = 0;
   private clipboard: { text: string; isLinewise: boolean } | null = null;
@@ -1281,6 +1447,11 @@ export class OutlineEditorTUI {
 
   private handleKeypress(key: readline.Key): void {
     if (this.closed) return;
+
+    if (this.mode === "SHELL") {
+      this.resumeFromShell();
+      return;
+    }
 
     if (this.showHelpOverlay) {
       const token = editKeyToken(key);
@@ -2156,6 +2327,13 @@ export class OutlineEditorTUI {
 
   private executeCommand(cmdLine: string): void {
     const raw = cmdLine.startsWith(":") ? cmdLine.slice(1).trim() : cmdLine.trim();
+    if (raw.startsWith("!")) {
+      // Split before this point would mangle a shell command's own
+      // whitespace/quoting, so `!` is handled before the generic tokenizer.
+      const shellCmd = raw.slice(1).trim();
+      if (shellCmd) this.runShellCommand(shellCmd);
+      return;
+    }
     const parts = raw.split(/\s+/);
     const cmd = parts[0];
     const arg = parts[1];
@@ -2186,6 +2364,53 @@ export class OutlineEditorTUI {
       this.statusMessage = `Unknown command: :${cmd}`;
       this.statusIsError = true;
     }
+  }
+
+  /**
+   * Vim-style `:!cmd`: suspend the TUI, run the command with the real
+   * terminal (so it can show output and read input), then wait for a key
+   * before redrawing — otherwise the alternate-screen switch back would hide
+   * the command's output before anyone could read it.
+   */
+  private runShellCommand(cmd: string): void {
+    this.mode = "SHELL";
+    this.shellResumeIsTTY = !!process.stdin.isTTY;
+    if (this.shellResumeIsTTY) {
+      process.stdin.setRawMode(false);
+      process.stdout.write("\x1b[?25h\x1b[?1049l");
+    }
+    process.stdout.write(`\n\x1b[1m$ ${cmd}\x1b[0m\n`);
+
+    let status: number | null = null;
+    try {
+      const shell = process.env.SHELL || "/bin/sh";
+      const result = spawnSync(shell, ["-c", cmd], { stdio: "inherit" });
+      if (result.error) {
+        process.stdout.write(`\n${result.error.message}\n`);
+        status = 1;
+      } else {
+        status = result.status;
+      }
+    } catch (err) {
+      process.stdout.write(`\n${err instanceof Error ? err.message : String(err)}\n`);
+      status = 1;
+    }
+
+    process.stdout.write(
+      `\n\x1b[2m[Command exited with code ${status ?? 0} — press any key to continue]\x1b[0m`
+    );
+    this.statusMessage = `Ran: ${cmd} (exit ${status ?? 0})`;
+    this.statusIsError = !!status;
+  }
+
+  /** Any key dismisses the `:!cmd` pause and redraws the TUI. */
+  private resumeFromShell(): void {
+    this.mode = "NORMAL";
+    if (this.shellResumeIsTTY) {
+      process.stdout.write("\x1b[?1049h\x1b[?25l\x1b[2J");
+      process.stdin.setRawMode(true);
+    }
+    this.render();
   }
 
   private initFileWatcher(): void {
@@ -2477,6 +2702,9 @@ export class OutlineEditorTUI {
 
   private render(): void {
     if (this.closed) return;
+    // While a `:!cmd` is suspended, the terminal is showing raw command
+    // output on the normal screen buffer, not the TUI.
+    if (this.mode === "SHELL") return;
 
     const cols = process.stdout.columns || 80;
     const rows = process.stdout.rows || 24;
@@ -2486,7 +2714,7 @@ export class OutlineEditorTUI {
     const modTag = (this.modified ? " \x1b[33m[+Modified]\x1b[0m" : "") +
                    (this.diskFileModified ? " \x1b[31m[Disk Modified]\x1b[0m" : "");
     let modeBadge = "\x1b[42;30m OUTLINE \x1b[0m";
-    const fieldTag = this.editField === "notes" ? "NOTE" : this.editField === "description" ? "DESC" : "TITLE";
+    const fieldTag = this.editField === "notes" ? "NOTE" : this.editField === "description" ? "CONTENT" : "TITLE";
     if (this.mode === "EDIT_NORMAL") {
       modeBadge = this.editingMultiline ? `\x1b[44;37m ${fieldTag}-NAV \x1b[0m` : "\x1b[44;37m EDIT-NAV \x1b[0m";
     } else if (this.mode === "VISUAL") {
@@ -2619,7 +2847,8 @@ export class OutlineEditorTUI {
         rightWidth,
         descHeight,
         editingField === "description",
-        "(no description — press 'E' to add slide content)"
+        "(no content — press 'E' to add)",
+        true
       );
       const notes = showNotes
         ? this.renderTextBlock(
@@ -2627,14 +2856,15 @@ export class OutlineEditorTUI {
             rightWidth,
             notesHeight,
             editingField === "notes",
-            "(no speaker notes — press 'N' to add)"
+            "(no speaker notes — press 'N' to add)",
+            false
           )
         : { rows: [], above: 0, below: 0 };
 
       const divider = `\x1b[2m${"─".repeat(rightWidth)}\x1b[0m`;
       rightLines.push(...metaLines);
       rightLines.push(divider);
-      rightLines.push(`\x1b[1mDescription:\x1b[0m${overflowTag(desc)}`);
+      rightLines.push(`\x1b[1mContent:\x1b[0m${overflowTag(desc)}`);
       rightLines.push(...desc.rows);
       // Pad the description out so the notes section stays flush to the bottom.
       while (rightLines.length < metaLines.length + 2 + descHeight) rightLines.push("");
@@ -2729,7 +2959,7 @@ export class OutlineEditorTUI {
     // Status / Prompt line
     let statusLine = "";
     if (this.mode === "VISUAL") {
-      const fieldName = this.editField === "notes" ? "NOTES" : this.editField === "description" ? "DESC" : "TITLE";
+      const fieldName = this.editField === "notes" ? "NOTES" : this.editField === "description" ? "CONTENT" : "TITLE";
       const sel = this.getSelectionRange();
       const countDesc = sel.isLinewise
         ? `${sel.text.split("\n").filter((_, idx, arr) => idx < arr.length - 1 || arr[idx].length > 0).length} lines`
@@ -2737,7 +2967,7 @@ export class OutlineEditorTUI {
       const typeDesc = this.visualType === "line" ? "LINE" : "CHAR";
       statusLine = ` \x1b[1;35mVISUAL (${typeDesc}) ${fieldName}:\x1b[0m \x1b[1m[${countDesc} selected]\x1b[0m \x1b[2m[y:Yank d:Cut p:Paste o:SwapEnd Tab:Pane Esc:Cancel]\x1b[0m`;
     } else if (this.mode === "EDIT_NORMAL" || this.mode === "INSERT") {
-      const fieldName = this.editField === "notes" ? "NOTES" : this.editField === "description" ? "DESC" : "TITLE";
+      const fieldName = this.editField === "notes" ? "NOTES" : this.editField === "description" ? "CONTENT" : "TITLE";
       const nav = this.mode === "EDIT_NORMAL";
       const promptLabel = `EDIT ${fieldName} (${nav ? "NAV" : "INSERT"}): `;
       // Multi-line fields echo just the line under the cursor; the full text
@@ -2801,7 +3031,7 @@ export class OutlineEditorTUI {
       "║    J / K          Reorder: move node down / up within siblings       ║",
       "║    Tab / >        Indent (demote)   Shift+Tab / <  Dedent (promote)  ║",
       "║    e / R / Enter  Edit title        i  Edit title → INSERT           ║",
-      "║    E / N          Edit description / speaker notes                   ║",
+      "║    E / N          Edit content / speaker notes                       ║",
       "║    v / V          Visual text selection on title                     ║",
       "║    yy / Y         Yank node title to clipboard                       ║",
       "║    p / P          Paste clipboard as new sibling below / above       ║",
@@ -2815,13 +3045,13 @@ export class OutlineEditorTUI {
       "║    v / V          Start characterwise / linewise visual selection    ║",
       "║    yw / ye / yy   Yank word / line to app-internal clipboard         ║",
       "║    p / P          Paste clipboard after / before cursor              ║",
-      "║    Tab / S-Tab    Cycle pane (Title ↔ Description ↔ Notes)           ║",
+      "║    Tab / S-Tab    Cycle pane (Title ↔ Content ↔ Notes)               ║",
       "║    Ctrl+W w       Cycle pane;  Ctrl+W h/l/j/k direct pane jump       ║",
-      "║    j / k          Move by logical line (description / notes); a      ║",
+      "║    j / k          Move by logical line (content / notes); a          ║",
       "║                   wrapped line is stepped over whole, as in vim      ║",
       "║    Esc / Enter    Confirm and return to NORMAL                       ║",
-      "║    Editing description / notes expands the right-hand pane; the      ║",
-      "║    arrows on a label (Description: ↑3 ↓12) count rows off-screen     ║",
+      "║    Editing content / notes expands the right-hand pane; the          ║",
+      "║    arrows on a label (Content: ↑3 ↓12) count rows off-screen         ║",
       "║                                                                      ║",
       "║  VISUAL MODE  (text selection across every pane)                     ║",
       "║    h/j/k/l/w/b/e  Extend selection  │  o  Swap cursor / anchor ends  ║",
@@ -2839,6 +3069,7 @@ export class OutlineEditorTUI {
       "║    :q  quit   :q!  force quit   :wq / :wq!  save & quit              ║",
       "║    :e <file>  open file         :e!  discard local edits & reload    ║",
       "║    :m [file]  export Markdown                                        ║",
+      "║    :!<cmd>    run a shell command (any key resumes the editor)       ║",
       "╚══════════════════════════════════════════════════════════════════════╝",
     ];
 
@@ -2894,7 +3125,8 @@ export class OutlineEditorTUI {
     width: number,
     height: number,
     editing: boolean,
-    emptyHint: string
+    emptyHint: string,
+    trackStructure: boolean
   ): { rows: string[]; above: number; below: number } {
     const empty = { rows: [] as string[], above: 0, below: 0 };
     if (height <= 0 || width <= 0) return empty;
@@ -2904,6 +3136,7 @@ export class OutlineEditorTUI {
 
     const info = editing ? getCursorLineInfo(this.input, this.inputCursor) : null;
     const logical = info ? info.lines : text.split("\n");
+    const lineStyles = computeMarkdownStyles(logical, trackStructure);
     // A block cursor can sit one column past the end of a row, so editing
     // wraps one column early to keep it inside the pane.
     const bodyWidth = editing ? Math.max(1, width - 1) : width;
@@ -2949,31 +3182,38 @@ export class OutlineEditorTUI {
     for (let ri = first; ri < last; ri++) {
       const row = rows[ri];
       const pad = " ".repeat(row.indent);
+      const rowStyles = lineStyles[row.line].slice(row.start, row.start + row.text.length);
 
       if (editing && this.mode === "VISUAL") {
         const sel = this.getSelectionRange();
         const lineStart = lineOffsets[row.line];
         const rowCharAbsStart = lineStart + row.start;
         let rowFormatted = "";
-        let inSel = false;
+        let openKey: string | null = null;
         for (let col = 0; col < row.text.length; col++) {
           const absIdx = rowCharAbsStart + col;
           const isSelected = absIdx >= sel.start && absIdx <= sel.end;
           const isCursor = absIdx === this.inputCursor;
           const ch = row.text[col];
+          const style = rowStyles[col] || "";
 
           if (isCursor) {
-            if (inSel) { rowFormatted += "\x1b[0m"; inSel = false; }
+            if (openKey !== null) { rowFormatted += "\x1b[0m"; openKey = null; }
             rowFormatted += `\x1b[7;1m${ch}\x1b[0m`;
-          } else if (isSelected) {
-            if (!inSel) { rowFormatted += "\x1b[48;5;24;37m"; inSel = true; }
-            rowFormatted += ch;
-          } else {
-            if (inSel) { rowFormatted += "\x1b[0m"; inSel = false; }
-            rowFormatted += ch;
+            continue;
           }
+          const key = isSelected || style ? `${isSelected ? 1 : 0}:${style}` : null;
+          if (key !== openKey) {
+            if (openKey !== null) rowFormatted += "\x1b[0m";
+            if (key !== null) {
+              if (isSelected) rowFormatted += "\x1b[48;5;24;37m";
+              if (style) rowFormatted += style;
+            }
+            openKey = key;
+          }
+          rowFormatted += ch;
         }
-        if (inSel) { rowFormatted += "\x1b[0m"; inSel = false; }
+        if (openKey !== null) rowFormatted += "\x1b[0m";
 
         if (ri === cursorRow && cursorCol >= row.text.length) {
           rowFormatted += `\x1b[7;1m \x1b[0m`;
@@ -2983,13 +3223,13 @@ export class OutlineEditorTUI {
       }
 
       if (ri !== cursorRow) {
-        out.push(truncateToWidth(pad + row.text, width, false));
+        out.push(truncateToWidth(pad + applyLineStyles(row.text, rowStyles), width, false));
         continue;
       }
       const col = Math.max(0, Math.min(cursorCol, row.text.length));
-      const before = row.text.slice(0, col);
+      const before = applyLineStyles(row.text.slice(0, col), rowStyles.slice(0, col));
       const cursorChar = col < row.text.length ? row.text[col] : " ";
-      const after = col < row.text.length ? row.text.slice(col + 1) : "";
+      const after = applyLineStyles(row.text.slice(col + 1), rowStyles.slice(col + 1));
       out.push(truncateToWidth(`${pad}${before}\x1b[7m${cursorChar}\x1b[0m${after}`, width, false));
     }
 
@@ -3091,7 +3331,7 @@ KEYBOARD SHORTCUTS
     Tab / >        Indent (demote)     Shift+Tab / <  Dedent (promote)
     e / R / Enter  Edit title → EDIT-NAV mode
     i              Edit title → INSERT mode directly
-    E              Edit description (→ INSERT if currently empty)
+    E              Edit content (→ INSERT if currently empty)
     N              Edit speaker notes (→ INSERT if currently empty)
     v / V          Visual text selection on title
     yy / Y         Yank node title to clipboard
@@ -3108,9 +3348,9 @@ KEYBOARD SHORTCUTS
     v / V          Start characterwise / linewise visual selection
     yw / ye / yy   Yank word / line to single-slot clipboard
     p / P          Paste clipboard after / before cursor
-    Tab / Shift+Tab Cycle active pane (Title ↔ Description ↔ Notes)
+    Tab / Shift+Tab Cycle active pane (Title ↔ Content ↔ Notes)
     Ctrl+W w       Cycle active pane (Ctrl+W h/l/j/k for directional jump)
-    j / k          Move cursor to next / previous logical line (description /
+    j / k          Move cursor to next / previous logical line (content /
                    notes). Long lines are soft-wrapped onto continuation rows,
                    so j / k step over a wrapped line as a whole, as in vim
                    without gj / gk.
@@ -3118,10 +3358,10 @@ KEYBOARD SHORTCUTS
     Ctrl+U         Delete to beginning of line (in INSERT)
     Esc / Enter    Confirm and return to NORMAL mode
 
-  While a description or notes field is being edited, the right-hand pane
+  While a content or notes field is being edited, the right-hand pane
   switches to a focus layout: the metadata collapses to the title and the other
   field to a single row, so the text being edited gets nearly the whole pane.
-  Arrows on a section label (for example \`Description: ↑3 ↓12\`) count the rows
+  Arrows on a section label (for example \`Content: ↑3 ↓12\`) count the rows
   scrolled out of view above and below.
 
   VISUAL MODE  (text selection across every pane)
@@ -3147,6 +3387,7 @@ KEYBOARD SHORTCUTS
     :e <file>      Open another file (warns if unsaved changes exist)
     :e!            Force reload from disk (discard local edits)
     :m [file]      Export outline to Markdown
+    :!<cmd>        Run a shell command (any key resumes the editor)
 
 FILE FORMAT
   Files are saved as Markdown slides. Top-level outline items become slides and

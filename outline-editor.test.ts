@@ -1,7 +1,16 @@
 import * as fs from "fs";
 import * as path from "path";
 import * as assert from "assert";
-import { OutlineEditorTUI, Outline } from "./outline-editor";
+import {
+  OutlineEditorTUI,
+  Outline,
+  computeMarkdownStyles,
+  MD_CAUTION,
+  MD_STRUCTURE,
+  MD_CODE,
+  MD_BOLD,
+  MD_DIM,
+} from "./outline-editor";
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -672,6 +681,138 @@ async function runTests() {
 
       editor.dispatchKey({ name: "r", ctrl: true });
       assert.strictEqual(editor.getOutline().root.children.length, initialTitles.length + 1);
+      (editor as any).quit(true);
+    });
+
+    // ----------------------------------------------------
+    // Fence-aware fromMarkdown parsing
+    // ----------------------------------------------------
+    await test("fromMarkdown treats fenced code block content as inert", () => {
+      const md = [
+        "# Slide One",
+        "",
+        "Intro text.",
+        "",
+        "```yaml",
+        "# a YAML comment, not a heading",
+        "---",
+        "::: notes",
+        "still just code",
+        ":::",
+        "```",
+        "",
+        "After the fence.",
+      ].join("\n");
+
+      const outline = new Outline();
+      outline.fromMarkdown(md);
+
+      assert.strictEqual(outline.root.children.length, 1);
+      const slide = outline.root.children[0];
+      assert.strictEqual(slide.title, "Slide One");
+      assert.strictEqual(slide.children.length, 0);
+      assert.strictEqual(slide.notes, "");
+      assert.ok(slide.description.includes("# a YAML comment, not a heading"));
+      assert.ok(slide.description.includes("---"));
+      assert.ok(slide.description.includes("::: notes"));
+      assert.ok(slide.description.includes("still just code"));
+      assert.ok(slide.description.includes(":::"));
+      assert.ok(slide.description.includes("After the fence."));
+    });
+
+    await test("fromMarkdown(toMarkdown()) round-trips fenced content verbatim", () => {
+      const outline = new Outline();
+      const slide = outline.addChild("root", "Fenced");
+      slide.description = [
+        "```js",
+        "# not a heading",
+        "---",
+        "```",
+        "",
+        "Trailing paragraph.",
+      ].join("\n");
+
+      const reloaded = new Outline();
+      reloaded.fromMarkdown(outline.toMarkdown());
+      assert.strictEqual(reloaded.root.children.length, 1);
+      assert.strictEqual(reloaded.root.children[0].description, slide.description);
+    });
+
+    // ----------------------------------------------------
+    // Markdown syntax highlighting (computeMarkdownStyles)
+    // ----------------------------------------------------
+    await test("computeMarkdownStyles flags structural risk lines in description only", () => {
+      const lines = ["# Looks like a heading", "---", "Plain text"];
+      const descStyles = computeMarkdownStyles(lines, true);
+      assert.ok(descStyles[0].every((s) => s === MD_CAUTION));
+      assert.ok(descStyles[1].every((s) => s === MD_CAUTION));
+      assert.ok(descStyles[2].every((s) => s === ""));
+
+      const notesStyles = computeMarkdownStyles(lines, false);
+      assert.ok(notesStyles[0].every((s) => s === ""));
+      assert.ok(notesStyles[1].every((s) => s === ""));
+    });
+
+    await test("computeMarkdownStyles leaves fenced content unstyled but flags its delimiters", () => {
+      const lines = ["```js", "# not a heading in here", "---", "```"];
+      const styles = computeMarkdownStyles(lines, true);
+      assert.ok(styles[0].every((s) => s === MD_STRUCTURE));
+      assert.ok(styles[1].every((s) => s === ""));
+      assert.ok(styles[2].every((s) => s === ""));
+      assert.ok(styles[3].every((s) => s === MD_STRUCTURE));
+    });
+
+    await test("computeMarkdownStyles highlights inline code and bold spans", () => {
+      const line = "Some `code` and **bold** text.";
+      const [styles] = computeMarkdownStyles([line], true);
+      const codeStart = line.indexOf("code");
+      const boldStart = line.indexOf("bold");
+      assert.strictEqual(styles[codeStart], MD_CODE);
+      assert.strictEqual(styles[boldStart], MD_BOLD);
+      assert.strictEqual(styles[line.indexOf("`")], MD_DIM);
+      assert.strictEqual(styles[line.indexOf("Some")], "");
+    });
+
+    await test("computeMarkdownStyles never changes the character count of a line", () => {
+      const lines = [
+        "# heading",
+        "```",
+        "fenced",
+        "```",
+        "**bold** `code` [link](url) | a | table |",
+      ];
+      for (const track of [true, false]) {
+        const styles = computeMarkdownStyles(lines, track);
+        for (let i = 0; i < lines.length; i++) {
+          assert.strictEqual(styles[i].length, lines[i].length);
+        }
+      }
+    });
+
+    // ----------------------------------------------------
+    // :!cmd shell escape
+    // ----------------------------------------------------
+    await test(":!cmd suspends into SHELL mode and resumes with the exit status", () => {
+      const editor = new OutlineEditorTUI(testFile);
+
+      editor.dispatchKey({ sequence: ":" });
+      for (const ch of "!true") editor.dispatchKey({ sequence: ch });
+      editor.dispatchKey({ name: "return" });
+      assert.strictEqual(editor.getMode(), "SHELL");
+
+      editor.dispatchKey({ name: "return" });
+      assert.strictEqual(editor.getMode(), "NORMAL");
+      assert.strictEqual(editor.getStatusMessage(), "Ran: true (exit 0)");
+
+      editor.dispatchKey({ sequence: ":" });
+      for (const ch of "!false") editor.dispatchKey({ sequence: ch });
+      editor.dispatchKey({ name: "return" });
+      assert.strictEqual(editor.getMode(), "SHELL");
+
+      editor.dispatchKey({ sequence: "x" });
+      assert.strictEqual(editor.getMode(), "NORMAL");
+      assert.ok(editor.getStatusMessage().includes("exit 1"));
+
       (editor as any).quit(true);
     });
 

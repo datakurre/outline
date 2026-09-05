@@ -40,19 +40,19 @@ Built with TypeScript using pure Node.js built-in modules—**zero runtime npm d
 - **Direct Tree Manipulation**: Instant reordering (`J`/`K`), promoting/demoting (`<`/`>` or `Tab`/`Shift+Tab`), branch folding/unfolding (`h`/`l`/`Space`, `zM`/`zR`), and subtree deletion with full structural undo/redo (`u`/`Ctrl+R`).
 - **Vim-Inspired Modal Architecture**:
   - `NORMAL`: Single-keystroke tree navigation and hierarchy restructuring.
-  - `EDIT-NAV`: Full vim normal-mode cursor motions (`h`/`j`/`k`/`l`, `w`/`b`/`e`, `0`/`$`, `d`, `c`, `r`, `s`, `yw`, `yy`, `p`, etc.) directly on title, description, and notes.
+  - `EDIT-NAV`: Full vim normal-mode cursor motions (`h`/`j`/`k`/`l`, `w`/`b`/`e`, `0`/`$`, `d`, `c`, `r`, `s`, `yw`, `yy`, `p`, etc.) directly on title, content, and notes.
   - `VISUAL`: Characterwise (`v`) and linewise (`V`) text selection across all panes.
   - `INSERT`: Seamless typing mode with word deletion (`Ctrl+W`) and line clearing (`Ctrl+U`).
   - `COMMAND`: Ex-style command line (`:w`, `:w!`, `:q`, `:q!`, `:wq`, `:e`, `:e!`, `:m`, `:help`).
 - **Two-Pane Interface with Dynamic Focus**:
   - Left pane displays the hierarchical outline tree with fold icons, connector lines, and selection cursor.
-  - Right pane inspects node metadata (ID, title, path, children count, depth), slide body (description), and speaker notes.
-  - Focus layout automatically collapses metadata when editing description or speaker notes, maximizing vertical space for long text and providing off-screen scroll counters (`Description: ↑3 ↓12`).
-- **Cross-Pane Unified Clipboard**: A single-slot clipboard shared between outline nodes and text fields. Yank a node in the tree and paste its title into a description; yank text from speaker notes and paste it as a new slide in the outline.
+  - Right pane inspects node metadata (ID, title, path, children count, depth), slide body (content), and speaker notes.
+  - Focus layout automatically collapses metadata when editing content or speaker notes, maximizing vertical space for long text and providing off-screen scroll counters (`Content: ↑3 ↓12`).
+- **Cross-Pane Unified Clipboard**: A single-slot clipboard shared between outline nodes and text fields. Yank a node in the tree and paste its title into a content field; yank text from speaker notes and paste it as a new slide in the outline.
 - **Markdown Slide Deck Format**:
   - Top-level items serialize as slides separated by `---` (compatible with Marp, reveal.js, Beamer, Slidev).
   - Nested nodes become markdown subheadings (`##`, `###`, etc.).
-  - Descriptions become slide body text.
+  - Content becomes slide body text.
   - Speaker notes serialize as pandoc `::: notes` fenced divs.
   - Preserves document YAML frontmatter without modification.
 - **Filesystem Auto-Refresh & Conflict Guard**:
@@ -117,7 +117,7 @@ If no file argument is provided, `outline-editor` defaults to `outline.md`. If t
     ├─• Left Pane: Outline Tree          │ Path: Introduction                   
     ├─• Right Pane: Node Details         │ Children: 0  Depth: 0                
   • Summary                              │ ─────────────────────────────────────
-                                         │ Description:                         
+                                         │ Content:                             
                                          │ Welcome to the presentation!         
                                          │                                      
                                          │ ─────────────────────────────────────
@@ -141,8 +141,8 @@ If no file argument is provided, `outline-editor` defaults to `outline.md`. If t
 ### Right Pane: Inspector & Focus Layout
 
 - Displays node metadata: unique ID, Title, Breadcrumb Path, Child Count, and Tree Depth.
-- Displays Description (slide body) and Speaker Notes.
-- **Focus Layout**: When you edit the Description or Notes field, the right pane automatically collapses metadata into compact single-line headers to dedicate almost the entire pane to editing. Section headers display scroll indicators such as `Description: ↑3 ↓12` to indicate rows scrolled off screen.
+- Displays Content (slide body) and Speaker Notes.
+- **Focus Layout**: When you edit the Content or Notes field, the right pane automatically collapses metadata into compact single-line headers to dedicate almost the entire pane to editing. Section headers display scroll indicators such as `Content: ↑3 ↓12` to indicate rows scrolled off screen.
 
 ---
 
@@ -168,7 +168,7 @@ Used for navigating the tree structure, reordering slides, and structural edits.
 | `c` | Insert new child node and enter `INSERT` mode |
 | `e` / `R` / `Enter` | Edit node title (enters `EDIT-NAV` mode) |
 | `i` | Edit node title directly (enters `INSERT` mode) |
-| `E` | Edit description (enters `EDIT-NAV`, or `INSERT` if empty) |
+| `E` | Edit content (enters `EDIT-NAV`, or `INSERT` if empty) |
 | `N` | Edit speaker notes (enters `EDIT-NAV`, or `INSERT` if empty) |
 | `v` / `V` | Enter `VISUAL` text selection on title |
 | `yy` / `Y` | Yank node title to clipboard |
@@ -203,7 +203,7 @@ Pressing `e`, `E`, or `N` from `NORMAL` mode enters `EDIT-NAV` mode on the selec
 | `yw` / `ye` / `yy` / `Y` | Yank word / to end of word / full line to clipboard |
 | `p` / `P` | Paste clipboard content after / before cursor |
 | `v` / `V` | Enter characterwise / linewise `VISUAL` mode |
-| `Tab` / `Shift+Tab` | Cycle active pane: Title ↔ Description ↔ Notes |
+| `Tab` / `Shift+Tab` | Cycle active pane: Title ↔ Content ↔ Notes |
 | `Ctrl+W w` | Cycle active pane (`Ctrl+W h/j/k/l` jumps directionally) |
 | `Esc` / `Enter` | Confirm edits and return to `NORMAL` mode |
 
@@ -236,7 +236,7 @@ Typing updates the active field immediately.
 | Key | Action |
 | --- | --- |
 | `Printable chars` | Insert character at cursor |
-| `Enter` | Single-line field (title): Confirm and return to `NORMAL`<br>Multiline field (description/notes): Insert newline |
+| `Enter` | Single-line field (title): Confirm and return to `NORMAL`<br>Multiline field (content/notes): Insert newline |
 | `Backspace` | Delete character before cursor |
 | `Delete` | Delete character at cursor |
 | `Ctrl+W` | Delete word backward |
@@ -263,6 +263,7 @@ Activated with `:` in `NORMAL` mode.
 | `:e <file>` | Open another file (warns if unsaved changes exist) |
 | `:e!` | Force reload from disk (discards unsaved local changes) |
 | `:m [file]` | Export outline to Markdown |
+| `:!<cmd>` | Run a shell command with the real terminal (vim-style); any key resumes the editor |
 | `:help` | Open the interactive help overlay |
 | `↑` / `↓` | Cycle through command history |
 | `Esc` | Cancel command prompt |
@@ -273,8 +274,8 @@ Activated with `:` in `NORMAL` mode.
 
 `outline-editor` features a single-slot clipboard `{ text: string, isLinewise: boolean }` shared seamlessly across all panes:
 
-- **From Tree to Fields**: Press `yy` on any node in `NORMAL` mode to yank its title, switch to editing a description or notes field, and press `p` to paste it.
-- **From Fields to Tree**: Select text with `v` or yank a line with `yy` in a description or notes field, return to `NORMAL` mode, and press `p` to insert a brand new outline slide with that text.
+- **From Tree to Fields**: Press `yy` on any node in `NORMAL` mode to yank its title, switch to editing a content or notes field, and press `p` to paste it.
+- **From Fields to Tree**: Select text with `v` or yank a line with `yy` in a content or notes field, return to `NORMAL` mode, and press `p` to insert a brand new outline slide with that text.
 - **Linewise Smart Pasting**: Linewise registers pasted into single-line fields (such as titles) automatically append cleanly to the head (`P`) or tail (`p`) without stray trailing newlines or misplaced spaces.
 
 ---
@@ -287,7 +288,7 @@ Outlines are saved as standard Markdown slide decks compatible with presentation
 
 - **Top-level items** (`# Heading`) are slides separated by `---`.
 - **Child items** (`## Heading`, `### Heading`) become hierarchical headings within that slide.
-- **Descriptions** become paragraphs under each heading.
+- **Content** becomes paragraphs under each heading.
 - **Speaker notes** are enclosed in pandoc `::: notes` fenced divs.
 
 ### Example Markdown File
@@ -336,6 +337,22 @@ Speaker notes round-trip cleanly as pandoc fenced divs (`::: notes` ... `:::`), 
 ### YAML Frontmatter
 
 YAML metadata blocks delimited by `---` at the beginning of the file are preserved verbatim when loading and saving.
+
+### Raw Markdown in Content & Notes
+
+A slide's content and speaker notes are opaque, unparsed Markdown: images
+(`![alt](url)`), tables, links, and inline formatting all round-trip
+byte-for-byte, and the editor lightly syntax-highlights them (headings,
+`**bold**`, `` `code` ``, links, list/blockquote markers, table pipes) without
+ever rewriting the underlying text. Content inside a fenced code block
+(` ``` ` or `~~~`) is treated as fully inert — a `#`-prefixed comment, a bare
+`---`, or a `::: notes` line inside a fence is never mistaken for slide
+structure. The one remaining caveat: a bare `---` line used as a Markdown
+thematic break in body text *outside* a fence is still swallowed on
+save/reload (write `***` or `___` instead if you need a rule there); the
+editor flags such a line, along with any stray heading or `::: notes` marker
+typed directly into content, in caution color so the risk is visible
+before you save.
 
 ---
 
