@@ -29,7 +29,7 @@ Key design principles:
 ## 2. File Map
 
 - [`outline-editor.ts`](file:///workspace/outline/outline-editor.ts):
-  - `OutlineNode`, `Outline`: Core hierarchical data structures, parent-child operations, tree walking, and bidirectional Markdown slide parsing/serialization (`toMarkdown`, `fromMarkdown`, frontmatter preservation, Pandoc `::: notes` div parsing).
+  - `OutlineNode`, `Outline`: Core hierarchical data structures, parent-child operations, tree walking, tree cloning (`cloneTree`, `restoreTree`), and bidirectional Markdown slide parsing/serialization (`toMarkdown`, `fromMarkdown`, frontmatter preservation, Pandoc `::: notes` div parsing).
   - Terminal helpers: ANSI string stripping, visual width calculation (`stringWidth`), line truncation (`truncateToWidth`), word wrapping (`wordWrap`), and key token normalizers (`normalKeyToken`, `editKeyToken`).
   - `OutlineEditorTUI`: Terminal UI engine handling raw-mode keypresses, ANSI terminal rendering, scrolling, modal dispatch, two-pane layout with dynamic focus mode, unified clipboard, directory-based file watching (`fs.watch`), auto-reload, and conflict resolution.
 - [`outline-editor.test.ts`](file:///workspace/outline/outline-editor.test.ts):
@@ -98,7 +98,7 @@ When modifying or refactoring `outline-editor.ts`, adhere to these established i
 - **Clean Reload**: When `!isModified()`, external changes reload immediately.
 - **Edit-Mode Deferral**: If an external change arrives while the user is actively editing in `EDIT_NORMAL`, `INSERT`, or `VISUAL` mode, the reload is deferred (`pendingReload = true`). The reload is only applied upon returning to `NORMAL` mode. Never swap out the active edit buffer under the user's cursor.
 - **Conflict Handling**: If local changes exist when an external change arrives, the editor warns and marks disk conflict. Regular `:w` is blocked; `:w!` forces overwrite, and `:e!` discards local edits.
-- **Undo Stack Boundary**: External reloads must clear `undoStack` and `redoStack`. Pre-reload snapshots must not be restored over external modifications.
+- **Undo Stack Boundary**: External reloads must clear `undoStack` and `redoStack`. Pre-reload snapshots must not be restored over external modifications. Undo snapshots are stored in memory via tree cloning (`cloneTree` / `restoreTree`).
 - **Cursor Stability via Heading Path**: `Outline.fromMarkdown` assigns IDs positionally (`node-1`, `node-2`, ...). An external insertion above the cursor alters all subsequent IDs. Cursor position across reloads must be restored using breadcrumb heading paths (`titlePath`) via `selectionAnchor()`.
 
 ### D. Unified Clipboard & Register Rules

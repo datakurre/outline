@@ -638,6 +638,43 @@ async function runTests() {
       if (fs.existsSync(md)) fs.unlinkSync(md);
     });
 
+    await test("cloneTree and restoreTree maintain tree integrity and undo/redo works", () => {
+      const outline = new Outline();
+      const child1 = outline.addChild("root", "Item 1");
+      outline.addChild(child1.id, "Subitem 1");
+      const clone = outline.cloneTree();
+
+      // Mutate original
+      outline.addChild("root", "Item 2");
+      assert.strictEqual(outline.root.children.length, 2);
+      assert.strictEqual(clone.children.length, 1);
+
+      // Restore
+      outline.restoreTree(clone);
+      assert.strictEqual(outline.root.children.length, 1);
+      assert.strictEqual(outline.root.children[0].title, "Item 1");
+      assert.strictEqual(outline.root.children[0].children[0].title, "Subitem 1");
+
+      // Verify ID generation after restore doesn't collide
+      const added = outline.addChild("root", "Item New");
+      assert.strictEqual(added.id, "node-3");
+
+      // Test structural undo/redo in editor
+      const editor = new OutlineEditorTUI(testFile);
+      const initialTitles = editor.getOutline().root.children.map((n: any) => n.title);
+      editor.dispatchKey({ sequence: "o" });
+      for (const ch of "Created") editor.dispatchKey({ sequence: ch });
+      editor.dispatchKey({ name: "return" });
+      assert.strictEqual(editor.getOutline().root.children.length, initialTitles.length + 1);
+
+      editor.dispatchKey({ sequence: "u" });
+      assert.deepStrictEqual(editor.getOutline().root.children.map((n: any) => n.title), initialTitles);
+
+      editor.dispatchKey({ name: "r", ctrl: true });
+      assert.strictEqual(editor.getOutline().root.children.length, initialTitles.length + 1);
+      (editor as any).quit(true);
+    });
+
   } finally {
     // A test that throws skips its own unlink, so sweep them all here rather
     // than leaving scratch files behind in the working directory.

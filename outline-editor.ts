@@ -133,42 +133,24 @@ export class Outline {
     return null;
   }
 
-  toJSON(): string {
-    return JSON.stringify(this.root, null, 2);
+  cloneTree(): OutlineNode {
+    return this.cloneNode(this.root);
   }
 
-  fromJSON(json: string): void {
-    const parsed: unknown = JSON.parse(json);
-    if (!this.isValidTree(parsed) || parsed.id !== "root") {
-      throw new Error("Invalid outline: expected a root node with a valid node tree");
-    }
-
-    parsed.collapsed = false;
-    this.root = parsed;
-    // `notes` post-dates the original format, so older trees — and undo
-    // snapshots taken before it existed — may omit it entirely.
-    this.walkNodes(this.root, (node) => {
-      if (typeof node.notes !== "string") node.notes = "";
-    });
+  restoreTree(root: OutlineNode): void {
+    this.root = this.cloneNode(root);
     this.updateNextId();
   }
 
-  private isValidTree(value: unknown, ids = new Set<string>()): value is OutlineNode {
-    if (typeof value !== "object" || value === null) return false;
-    const node = value as Partial<OutlineNode>;
-    if (
-      typeof node.id !== "string" ||
-      typeof node.title !== "string" ||
-      typeof node.description !== "string" ||
-      (node.notes !== undefined && typeof node.notes !== "string") ||
-      typeof node.collapsed !== "boolean" ||
-      !Array.isArray(node.children) ||
-      ids.has(node.id)
-    ) {
-      return false;
-    }
-    ids.add(node.id);
-    return node.children.every((child) => this.isValidTree(child, ids));
+  private cloneNode(node: OutlineNode): OutlineNode {
+    return {
+      id: node.id,
+      title: node.title,
+      description: node.description,
+      notes: node.notes ?? "",
+      children: node.children.map((child) => this.cloneNode(child)),
+      collapsed: Boolean(node.collapsed),
+    };
   }
 
   private updateNextId(): void {
@@ -555,8 +537,8 @@ export class OutlineEditorTUI {
   private showHelpOverlay: boolean = false;
   private helpScroll: number = 0;
   private pendingSequence: string = "";
-  private undoStack: string[] = [];
-  private redoStack: string[] = [];
+  private undoStack: OutlineNode[] = [];
+  private redoStack: OutlineNode[] = [];
   private commandHistory: string[] = [];
   private commandHistoryIdx: number = -1;
 
@@ -569,9 +551,7 @@ export class OutlineEditorTUI {
     if (fs.existsSync(filename)) {
       try {
         const data = fs.readFileSync(filename, "utf8");
-        // Keep existing JSON outlines readable, but all writes use Markdown.
-        if (/^\s*\{/.test(data)) this.outline.fromJSON(data);
-        else this.outline.fromMarkdown(data);
+        this.outline.fromMarkdown(data);
         this.statusMessage = `Loaded ${filename}`;
         this.statusIsError = false;
       } catch (err) {
@@ -674,7 +654,7 @@ export class OutlineEditorTUI {
   }
 
   private snapshot(): void {
-    this.undoStack.push(this.outline.toJSON());
+    this.undoStack.push(this.outline.cloneTree());
     if (this.undoStack.length > 100) {
       this.undoStack.shift();
     }
@@ -982,7 +962,7 @@ export class OutlineEditorTUI {
       const prev = this.undoStack.pop();
       if (prev) {
         try {
-          this.outline.fromJSON(prev);
+          this.outline.restoreTree(prev);
           this.redoStack = [];
         } catch {
           // If restore fails, fall back to plain delete.
@@ -1265,8 +1245,8 @@ export class OutlineEditorTUI {
     const prev = this.undoStack.pop();
     if (prev) {
       try {
-        this.redoStack.push(this.outline.toJSON());
-        this.outline.fromJSON(prev);
+        this.redoStack.push(this.outline.cloneTree());
+        this.outline.restoreTree(prev);
         this.clampSelection();
         this.statusMessage = "Undo applied";
         this.statusIsError = false;
@@ -1284,8 +1264,8 @@ export class OutlineEditorTUI {
     const next = this.redoStack.pop();
     if (next) {
       try {
-        this.undoStack.push(this.outline.toJSON());
-        this.outline.fromJSON(next);
+        this.undoStack.push(this.outline.cloneTree());
+        this.outline.restoreTree(next);
         this.clampSelection();
         this.statusMessage = "Redo applied";
         this.statusIsError = false;
@@ -2302,8 +2282,7 @@ export class OutlineEditorTUI {
     try {
       const data = fs.readFileSync(this.filename, "utf8");
       const anchor = this.selectionAnchor();
-      if (/^\s*\{/.test(data)) this.outline.fromJSON(data);
-      else this.outline.fromMarkdown(data);
+      this.outline.fromMarkdown(data);
 
       this.restoreSelection(anchor);
       this.undoStack = [];
@@ -2404,11 +2383,7 @@ export class OutlineEditorTUI {
   }
 
   private saveFile(targetFile?: string, force: boolean = false): void {
-    // A legacy .json input is migrated to a Markdown file instead of being
-    // silently overwritten with a different format.
-    const file = targetFile || (/\.json$/i.test(this.filename)
-      ? this.filename.replace(/\.json$/i, ".md")
-      : this.filename);
+    const file = targetFile || this.filename;
     try {
       let currentMtime = 0;
       if (fs.existsSync(file)) {
@@ -2465,8 +2440,7 @@ export class OutlineEditorTUI {
     try {
       if (fs.existsSync(file)) {
         const data = fs.readFileSync(file, "utf8");
-        if (/^\s*\{/.test(data)) this.outline.fromJSON(data);
-        else this.outline.fromMarkdown(data);
+        this.outline.fromMarkdown(data);
         this.filename = file;
         this.currentIndex = 0;
         this.scrollOffset = 0;
@@ -3093,8 +3067,7 @@ DESCRIPTION
   indent/dedent restructuring, inline editing, undo/redo, and two-pane inspection.
 
   FILE specifies the Markdown slide file to read/write (defaults to outline.md).
-  Existing JSON outline files can still be opened and are migrated to Markdown on
-  save. If FILE does not exist, a starter outline is created in memory. Changes remain in memory
+  If FILE does not exist, a starter outline is created in memory. Changes remain in memory
   until saved via :w or Ctrl+S.
 
   Auto-reloads external changes from the filesystem when no local edits are pending.

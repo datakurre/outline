@@ -28,7 +28,6 @@ Built with TypeScript using pure Node.js built-in modules—**zero runtime npm d
   - [Slide Structure](#slide-structure)
   - [Speaker Notes (Pandoc `::: notes`)](#speaker-notes-pandoc--notes)
   - [YAML Frontmatter](#yaml-frontmatter)
-  - [Legacy JSON Support](#legacy-json-support)
 - [Filesystem Auto-Refresh & Conflict Guard](#filesystem-auto-refresh--conflict-guard)
 - [Environment Variables](#environment-variables)
 - [Running Tests](#running-tests)
@@ -337,10 +336,6 @@ Speaker notes round-trip cleanly as pandoc fenced divs (`::: notes` ... `:::`), 
 ### YAML Frontmatter
 
 YAML metadata blocks delimited by `---` at the beginning of the file are preserved verbatim when loading and saving.
-
-### Legacy JSON Support
-
-Existing `.json` outlines from earlier versions can be opened transparently. On save, they are automatically migrated to `.md`.
 
 ---
 
