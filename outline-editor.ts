@@ -1,4 +1,5 @@
 import * as fs from "fs";
+import * as path from "path";
 import * as readline from "readline";
 
 // Core data model
@@ -431,6 +432,21 @@ function normalKeyToken(key: readline.Key): string {
 }
 
 /**
+ * Collapse a keypress to the token the EDIT-NAV and VISUAL dispatchers match on.
+ *
+ * Matching on `sequence || name` cannot work for both halves of a vim keymap:
+ * a printable key has to match its literal (`$`, `^`, `V` differ from their
+ * names), but every other key arrives with a non-empty `sequence` too — Tab is
+ * `"\t"`, Right is `"\x1b[C"` — which shadows the name and makes those cases
+ * unreachable. So: printables by sequence, everything else by name.
+ */
+function editKeyToken(key: readline.Key): string {
+  const seq = key.sequence || "";
+  if (seq.length === 1 && seq >= " " && seq !== "\x7f") return seq;
+  return key.name || seq;
+}
+
+/**
  * Word-wrap one logical line into visual rows, preserving the original
  * characters exactly and recording where each row starts within the line.
  * Those offsets are what let a cursor position be mapped onto the wrapped
@@ -501,26 +517,43 @@ export class OutlineEditorTUI {
   private filename: string;
   private currentIndex: number = 0;
   private scrollOffset: number = 0;
-  // Two levels of navigation:
-  // Level 1: "NORMAL" (outline tree navigation)
-  // Level 2: "EDIT_NORMAL" (node text navigation before typing changes)
-  // Level 3: "INSERT" (typing changes)
-  private mode: "NORMAL" | "EDIT_NORMAL" | "INSERT" | "COMMAND" = "NORMAL";
+  // Navigation levels and modes:
+  // "NORMAL" (outline tree navigation)
+  // "EDIT_NORMAL" (node text navigation before typing changes)
+  // "VISUAL" (characterwise or linewise visual selection)
+  // "INSERT" (typing changes)
+  // "COMMAND" (ex commands :w, :q, etc.)
+  private mode: "NORMAL" | "EDIT_NORMAL" | "VISUAL" | "INSERT" | "COMMAND" = "NORMAL";
+  private visualType: "char" | "line" = "char";
+  private visualAnchor: number = 0;
+  private clipboard: { text: string; isLinewise: boolean } | null = null;
   private input: string = "";
   private inputCursor: number = 0;
   private editField: EditField = "title";
   private pendingEditOp: string = "";
+  private pendingCtrlW: boolean = false;
+  private pendingVisualG: boolean = false;
   private textUndoStack: { input: string; cursor: number }[] = [];
   private textRedoStack: { input: string; cursor: number }[] = [];
-  private textYankBuffer: string = "";
   private command: string = "";
   private commandCursor: number = 0;
   private statusMessage: string = "Ready";
   private statusIsError: boolean = false;
-  private modified: boolean = false;
+  // The markdown that was last written to (or read from) disk. Dirtiness is
+  // derived from it rather than tracked with a flag, because a flag set by
+  // `snapshot()` also fires when a node is merely opened for editing — and
+  // auto-reload keys off dirtiness, so a false positive there silently
+  // disables the refresh for the rest of the session.
+  private savedMarkdown: string = "";
+  private fileWatcher: fs.FSWatcher | null = null;
+  private fileMtimeMs: number = 0;
+  private diskFileModified: boolean = false;
+  private pendingReload: boolean = false;
+  private reloadDebounceTimer: NodeJS.Timeout | null = null;
   private closed: boolean = false;
   private onClosed: (() => void) | null = null;
   private showHelpOverlay: boolean = false;
+  private helpScroll: number = 0;
   private pendingSequence: string = "";
   private undoStack: string[] = [];
   private redoStack: string[] = [];
@@ -553,6 +586,8 @@ export class OutlineEditorTUI {
       this.outline.addChild(mainContent.id, "Section 1");
       this.outline.addChild(mainContent.id, "Section 2");
     }
+    this.markSaved();
+    this.initFileWatcher();
   }
 
   async run(): Promise<void> {
@@ -607,13 +642,43 @@ export class OutlineEditorTUI {
     }
   }
 
+  /**
+   * True when what would be written to disk differs from what is on it.
+   *
+   * Two independent sources of dirt: the tree itself, compared through
+   * `toMarkdown()` because that is exactly what gets persisted (so folding a
+   * node, which only touches `collapsed`, never counts), and the edit buffer,
+   * whose text is not committed back into the node until the edit finishes.
+   *
+   * Derived rather than tracked with a flag: `snapshot()` runs when a node is
+   * merely opened for editing, so a flag it set would report dirt after an
+   * `e` `Esc` that changed nothing — and auto-reload keys off dirtiness, so
+   * that false positive would disable the refresh for the rest of the session.
+   */
+  private get modified(): boolean {
+    return this.outline.toMarkdown() !== this.savedMarkdown || this.bufferDirty;
+  }
+
+  /** Uncommitted text in the edit buffer, which lives outside the tree. */
+  private get bufferDirty(): boolean {
+    if (this.mode !== "EDIT_NORMAL" && this.mode !== "INSERT" && this.mode !== "VISUAL") {
+      return false;
+    }
+    const node = this.selectedNode;
+    return node ? this.input !== this.readField(node) : false;
+  }
+
+  /** Re-baseline dirtiness against the tree as it now stands on disk. */
+  private markSaved(): void {
+    this.savedMarkdown = this.outline.toMarkdown();
+  }
+
   private snapshot(): void {
     this.undoStack.push(this.outline.toJSON());
     if (this.undoStack.length > 100) {
       this.undoStack.shift();
     }
     this.redoStack = [];
-    this.modified = true;
   }
 
   private moveSelection(delta: number): void {
@@ -735,7 +800,6 @@ export class OutlineEditorTUI {
       this.textRedoStack.push({ input: this.input, cursor: this.inputCursor });
       this.input = state.input;
       this.inputCursor = Math.min(this.input.length, state.cursor);
-      this.modified = true;
     }
   }
 
@@ -745,7 +809,6 @@ export class OutlineEditorTUI {
       this.textUndoStack.push({ input: this.input, cursor: this.inputCursor });
       this.input = state.input;
       this.inputCursor = Math.min(this.input.length, state.cursor);
-      this.modified = true;
     }
   }
 
@@ -882,7 +945,7 @@ export class OutlineEditorTUI {
     return node.title;
   }
 
-  private finishEdit(): void {
+  private commitField(): void {
     const node = this.selectedNode;
     if (node) {
       if (this.editField === "description") {
@@ -892,17 +955,23 @@ export class OutlineEditorTUI {
       } else {
         node.title = this.input.trim() || "Untitled";
       }
-      this.modified = true;
     }
+  }
+
+  private finishEdit(): void {
+    this.commitField();
     this.mode = "NORMAL";
     this.input = "";
     this.inputCursor = 0;
     this.editField = "title";
     this.pendingEditOp = "";
+    this.pendingCtrlW = false;
+    this.pendingVisualG = false;
     this.textUndoStack = [];
     this.textRedoStack = [];
     this.statusMessage = "Ready";
     this.statusIsError = false;
+    this.applyPendingReload();
   }
 
   private cancelEdit(): void {
@@ -929,8 +998,255 @@ export class OutlineEditorTUI {
     this.inputCursor = 0;
     this.editField = "title";
     this.pendingEditOp = "";
+    this.pendingCtrlW = false;
+    this.pendingVisualG = false;
     this.textUndoStack = [];
     this.textRedoStack = [];
+    this.applyPendingReload();
+  }
+
+  private switchPane(targetField?: EditField): void {
+    const current = this.selectedNode;
+    if (!current) return;
+    this.commitField();
+    const order: EditField[] = ["title", "description", "notes"];
+    const currentIdx = order.indexOf(this.editField);
+    const nextField = targetField || order[(currentIdx + 1) % order.length];
+    this.editField = nextField;
+    this.input = this.readField(current);
+    this.inputCursor = this.editingMultiline ? 0 : Math.max(0, this.input.length - 1);
+    this.mode = "EDIT_NORMAL";
+    this.pendingEditOp = "";
+    this.pendingCtrlW = false;
+    this.textUndoStack = [];
+    this.textRedoStack = [];
+    this.statusMessage = `Navigating ${this.editFieldLabel} — h/l/w/b:Move  i/a:Insert  v:Visual  Tab:Pane  Esc/Enter:Done`;
+    this.statusIsError = false;
+  }
+
+  private switchPanePrev(): void {
+    // No commitField here: switchPane does it, and doing it twice wrote the
+    // same buffer back into the node on every Shift+Tab.
+    const order: EditField[] = ["title", "description", "notes"];
+    const currentIdx = order.indexOf(this.editField);
+    this.switchPane(order[(currentIdx + order.length - 1) % order.length]);
+  }
+
+  private getSelectionRange(): { start: number; end: number; text: string; isLinewise: boolean } {
+    if (this.visualType === "line") {
+      const aInfo = getCursorLineInfo(this.input, this.visualAnchor);
+      const cInfo = getCursorLineInfo(this.input, this.inputCursor);
+      const minLine = Math.min(aInfo.line, cInfo.line);
+      const maxLine = Math.max(aInfo.line, cInfo.line);
+      const lines = aInfo.lines;
+      let lineStart = 0;
+      for (let i = 0; i < minLine; i++) {
+        lineStart += lines[i].length + 1;
+      }
+      let lineEnd = lineStart;
+      for (let i = minLine; i <= maxLine; i++) {
+        lineEnd += lines[i].length + (i < lines.length - 1 ? 1 : 0);
+      }
+      const text = this.input.slice(lineStart, lineEnd);
+      return {
+        start: lineStart,
+        end: Math.max(lineStart, lineEnd > lineStart ? lineEnd - 1 : lineStart),
+        text,
+        isLinewise: true,
+      };
+    } else {
+      const start = Math.min(this.visualAnchor, this.inputCursor);
+      const end = Math.max(this.visualAnchor, this.inputCursor);
+      const text = this.input.length > 0 ? this.input.slice(start, end + 1) : "";
+      return { start, end, text, isLinewise: false };
+    }
+  }
+
+  private yankSelection(): void {
+    if (!this.input) {
+      this.mode = "EDIT_NORMAL";
+      this.statusMessage = "Nothing to yank";
+      this.statusIsError = false;
+      return;
+    }
+    const sel = this.getSelectionRange();
+    this.clipboard = { text: sel.text, isLinewise: sel.isLinewise };
+    this.mode = "EDIT_NORMAL";
+    this.inputCursor = sel.start;
+    const countDesc = sel.isLinewise
+      ? `${sel.text.split("\n").filter((_, idx, arr) => idx < arr.length - 1 || arr[idx].length > 0).length} lines`
+      : `${sel.text.length} chars`;
+    this.statusMessage = `Yanked ${countDesc} to clipboard`;
+    this.statusIsError = false;
+  }
+
+  private deleteSelection(isChange: boolean = false): void {
+    if (!this.input) {
+      this.mode = isChange ? "INSERT" : "EDIT_NORMAL";
+      return;
+    }
+    this.pushTextUndo();
+    const sel = this.getSelectionRange();
+    this.clipboard = { text: sel.text, isLinewise: sel.isLinewise };
+    if (sel.isLinewise) {
+      const lines = this.input.split("\n");
+      const aInfo = getCursorLineInfo(this.input, this.visualAnchor);
+      const cInfo = getCursorLineInfo(this.input, this.inputCursor);
+      const minLine = Math.min(aInfo.line, cInfo.line);
+      const maxLine = Math.max(aInfo.line, cInfo.line);
+      lines.splice(minLine, maxLine - minLine + 1);
+      this.input = lines.join("\n");
+      const newLines = this.input.split("\n");
+      const targetLine = Math.min(minLine, Math.max(0, newLines.length - 1));
+      let pos = 0;
+      for (let i = 0; i < targetLine; i++) pos += newLines[i].length + 1;
+      this.inputCursor = pos;
+    } else {
+      this.input = this.input.slice(0, sel.start) + this.input.slice(sel.end + 1);
+      this.inputCursor = Math.min(sel.start, Math.max(0, this.input.length - 1));
+    }
+    if (isChange) {
+      this.mode = "INSERT";
+    } else {
+      this.mode = "EDIT_NORMAL";
+      this.statusMessage = `Cut ${sel.isLinewise ? "lines" : `${sel.text.length} chars`} to clipboard`;
+      this.statusIsError = false;
+    }
+  }
+
+  private pasteInEditMode(before: boolean = false): void {
+    if (!this.clipboard || !this.clipboard.text) {
+      this.statusMessage = "Clipboard is empty";
+      this.statusIsError = true;
+      return;
+    }
+    this.pushTextUndo();
+    // A single-line field has nowhere to put a line break. Trailing newlines
+    // are dropped rather than turned into spaces — a linewise yank always
+    // carries one, and substituting it left a stray space on every paste.
+    const flatten = (text: string): string =>
+      this.editingMultiline ? text : text.replace(/[\r\n]+$/, "").replace(/\r?\n/g, " ");
+
+    if (this.mode === "VISUAL") {
+      const sel = this.getSelectionRange();
+      const pasteText = flatten(this.clipboard.text);
+      this.input = this.input.slice(0, sel.start) + pasteText + this.input.slice(sel.end + 1);
+      this.inputCursor = sel.start + Math.max(0, pasteText.length - 1);
+      this.mode = "EDIT_NORMAL";
+    } else {
+      const pasteText = flatten(this.clipboard.text);
+      if (this.clipboard.isLinewise && !this.editingMultiline) {
+        // Linewise content into a one-line field: the nearest thing to "put
+        // the line above/below" is the head or tail of the field. Splicing it
+        // at the cursor instead would drop it into the middle of a word.
+        if (this.input.length === 0) {
+          this.input = pasteText;
+          this.inputCursor = Math.max(0, pasteText.length - 1);
+        } else if (before) {
+          this.input = `${pasteText} ${this.input}`;
+          this.inputCursor = 0;
+        } else {
+          this.inputCursor = this.input.length + 1;
+          this.input = `${this.input} ${pasteText}`;
+        }
+      } else if (this.clipboard.isLinewise && this.editingMultiline) {
+        const info = getCursorLineInfo(this.input, this.inputCursor);
+        const textToInsert = pasteText.endsWith("\n") ? pasteText : pasteText + "\n";
+        if (before) {
+          this.input = this.input.slice(0, info.lineStart) + textToInsert + this.input.slice(info.lineStart);
+          this.inputCursor = info.lineStart;
+        } else {
+          const insertPos = info.lineEnd < this.input.length ? info.lineEnd + 1 : this.input.length;
+          const prefix = info.lineEnd === this.input.length && this.input.length > 0 && !this.input.endsWith("\n") ? "\n" : "";
+          this.input = this.input.slice(0, insertPos) + prefix + textToInsert + this.input.slice(insertPos);
+          this.inputCursor = insertPos + prefix.length;
+        }
+      } else {
+        if (this.input.length === 0) {
+          this.input = pasteText;
+          this.inputCursor = Math.max(0, pasteText.length - 1);
+        } else {
+          const insertPos = before ? this.inputCursor : Math.min(this.input.length, this.inputCursor + 1);
+          this.input = this.input.slice(0, insertPos) + pasteText + this.input.slice(insertPos);
+          this.inputCursor = insertPos + pasteText.length - 1;
+        }
+      }
+    }
+    this.statusMessage = "Pasted from clipboard";
+    this.statusIsError = false;
+  }
+
+  private yankCurrentNode(): void {
+    const current = this.selectedNode;
+    if (!current) return;
+    this.clipboard = { text: current.title, isLinewise: true };
+    this.statusMessage = `Yanked node title to clipboard: "${current.title}"`;
+    this.statusIsError = false;
+  }
+
+  private pasteNode(before: boolean = false): void {
+    if (!this.clipboard || !this.clipboard.text) {
+      this.statusMessage = "Clipboard is empty";
+      this.statusIsError = true;
+      return;
+    }
+    const current = this.selectedNode;
+    this.snapshot();
+    const rawLines = this.clipboard.text.replace(/\r\n?/g, "\n").trimEnd().split("\n");
+    const title = rawLines[0].trim() || "Untitled";
+    const description = rawLines.slice(1).join("\n").trim();
+
+    let newNode: OutlineNode;
+    if (!current || current.id === "root") {
+      newNode = this.outline.addChild("root", title);
+    } else if (before) {
+      newNode = this.outline.addSiblingBefore(current.id, title);
+    } else {
+      newNode = this.outline.addSibling(current.id, title);
+    }
+    if (description) {
+      newNode.description = description;
+    }
+    const visible = this.visibleNodes;
+    const idx = visible.findIndex((item) => item.id === newNode.id);
+    if (idx >= 0) this.currentIndex = idx;
+    this.clampSelection();
+    this.statusMessage = `Pasted new node "${title}" from clipboard`;
+    this.statusIsError = false;
+  }
+
+  // Programmatic testing helpers
+  getMode(): string { return this.mode; }
+  getEditField(): EditField { return this.editField; }
+  getInput(): string { return this.input; }
+  getInputCursor(): number { return this.inputCursor; }
+  getVisualAnchor(): number { return this.visualAnchor; }
+  getVisualType(): "char" | "line" { return this.visualType; }
+  getClipboard(): { text: string; isLinewise: boolean } | null { return this.clipboard ? { ...this.clipboard } : null; }
+  setClipboard(slot: { text: string; isLinewise: boolean } | null): void { this.clipboard = slot ? { ...slot } : null; }
+  isModified(): boolean { return this.modified; }
+  isDiskFileModified(): boolean { return this.diskFileModified; }
+  getStatusMessage(): string { return this.statusMessage; }
+  getOutline(): Outline { return this.outline; }
+  getCurrentIndex(): number { return this.currentIndex; }
+  /**
+   * Feed a keypress in without a terminal.
+   *
+   * `sequence` defaults only for single-character names: defaulting it for a
+   * named key would invent input no terminal sends (readline delivers Tab as
+   * `"\t"`, never `"tab"`) and let a test pass against a dispatcher that a
+   * real keyboard cannot reach.
+   */
+  dispatchKey(key: Partial<readline.Key>): void {
+    const name = key.name || "";
+    const fullKey: readline.Key = {
+      sequence: key.sequence !== undefined ? key.sequence : (name.length === 1 ? name : ""),
+      name,
+      ctrl: !!key.ctrl,
+      meta: !!key.meta,
+      shift: !!key.shift,
+    };
+    this.handleKeypress(fullKey);
   }
 
   private deleteCurrentNode(): void {
@@ -952,7 +1268,6 @@ export class OutlineEditorTUI {
         this.redoStack.push(this.outline.toJSON());
         this.outline.fromJSON(prev);
         this.clampSelection();
-        this.modified = true;
         this.statusMessage = "Undo applied";
         this.statusIsError = false;
       } catch (err) {
@@ -972,7 +1287,6 @@ export class OutlineEditorTUI {
         this.undoStack.push(this.outline.toJSON());
         this.outline.fromJSON(next);
         this.clampSelection();
-        this.modified = true;
         this.statusMessage = "Redo applied";
         this.statusIsError = false;
       } catch (err) {
@@ -989,15 +1303,209 @@ export class OutlineEditorTUI {
     if (this.closed) return;
 
     if (this.showHelpOverlay) {
-      if (key.name === "escape" || key.name === "?" || key.name === "q" || key.name === "return") {
+      const token = editKeyToken(key);
+      if (token === "escape" || token === "?" || token === "q" || token === "return") {
         this.showHelpOverlay = false;
+        this.helpScroll = 0;
+      } else if (token === "j" || token === "down") {
+        this.helpScroll++;
+      } else if (token === "k" || token === "up") {
+        this.helpScroll = Math.max(0, this.helpScroll - 1);
+      } else if (token === " " || (key.ctrl && key.name === "f") || token === "pagedown") {
+        this.helpScroll += 10;
+      } else if ((key.ctrl && key.name === "b") || token === "pageup") {
+        this.helpScroll = Math.max(0, this.helpScroll - 10);
+      } else if (token === "G" || token === "end") {
+        this.helpScroll = Number.MAX_SAFE_INTEGER;
+      } else if (token === "home") {
+        this.helpScroll = 0;
       }
+      // render() clamps helpScroll against the height it actually has.
+      this.render();
+      return;
+    }
+
+    if (this.mode === "VISUAL") {
+      const seq = editKeyToken(key);
+
+      if (key.name === "escape" || (key.ctrl && key.name === "c")) {
+        this.mode = "EDIT_NORMAL";
+        this.pendingVisualG = false;
+        this.statusMessage = "Visual mode cancelled";
+        this.statusIsError = false;
+        this.render();
+        return;
+      }
+
+      if (key.ctrl && key.name === "s") {
+        this.finishEdit();
+        this.saveFile();
+        this.render();
+        return;
+      }
+
+      // Tab or Shift+Tab switches pane
+      if (key.name === "tab") {
+        if (key.shift) this.switchPanePrev();
+        else this.switchPane();
+        this.render();
+        return;
+      }
+
+      // Toggle visual mode type or exit
+      if (seq === "v") {
+        if (this.visualType === "char") {
+          this.mode = "EDIT_NORMAL";
+        } else {
+          this.visualType = "char";
+        }
+        this.render();
+        return;
+      }
+      if (seq === "V") {
+        if (this.visualType === "line") {
+          this.mode = "EDIT_NORMAL";
+        } else {
+          this.visualType = "line";
+        }
+        this.render();
+        return;
+      }
+
+      // Swap cursor and anchor ends (vim 'o')
+      if (seq === "o") {
+        const tmp = this.inputCursor;
+        this.inputCursor = this.visualAnchor;
+        this.visualAnchor = tmp;
+        this.render();
+        return;
+      }
+
+      // Clipboard / editing actions
+      if (seq === "y") {
+        this.yankSelection();
+        this.render();
+        return;
+      }
+      if (seq === "d" || seq === "x" || key.name === "delete") {
+        this.deleteSelection(false);
+        this.render();
+        return;
+      }
+      if (seq === "c" || seq === "s") {
+        this.deleteSelection(true);
+        this.render();
+        return;
+      }
+      if (seq === "p" || seq === "P") {
+        this.pasteInEditMode(false);
+        this.render();
+        return;
+      }
+      if (seq === "u") {
+        this.popTextUndo();
+        this.mode = "EDIT_NORMAL";
+        this.render();
+        return;
+      }
+
+      // `gg` is two keypresses, so it needs a pending state; a lone `g`
+      // followed by anything else is simply dropped, as in NORMAL mode.
+      if (this.pendingVisualG) {
+        this.pendingVisualG = false;
+        if (seq === "g") {
+          this.inputCursor = 0;
+          this.render();
+          return;
+        }
+      } else if (seq === "g") {
+        this.pendingVisualG = true;
+        this.render();
+        return;
+      }
+
+      // Motions
+      const info = getCursorLineInfo(this.input, this.inputCursor);
+      switch (seq) {
+        case "h":
+        case "left":
+          if (info.col > 0) this.inputCursor--;
+          break;
+        case "l":
+        case "right":
+          if (info.lineText.length > 0 && info.col < info.lineText.length - 1) this.inputCursor++;
+          break;
+        case "j":
+        case "down":
+          if (this.editingMultiline && info.line < info.lines.length - 1) {
+            const nextLineStart = info.lineEnd + 1;
+            const nextLineText = info.lines[info.line + 1];
+            const targetCol = Math.min(info.col, Math.max(0, nextLineText.length - 1));
+            this.inputCursor = nextLineStart + targetCol;
+          }
+          break;
+        case "k":
+        case "up":
+          if (this.editingMultiline && info.line > 0) {
+            const prevLineText = info.lines[info.line - 1];
+            const prevLineStart = this.input.slice(0, info.lineStart - 1).lastIndexOf("\n") + 1;
+            const targetCol = Math.min(info.col, Math.max(0, prevLineText.length - 1));
+            this.inputCursor = prevLineStart + targetCol;
+          }
+          break;
+        case "0":
+        case "^":
+        case "home":
+          this.inputCursor = info.lineStart;
+          break;
+        case "$":
+        case "end":
+          this.inputCursor = Math.max(info.lineStart, info.lineEnd > info.lineStart ? info.lineEnd - 1 : info.lineStart);
+          break;
+        case "w":
+          this.inputCursor = this.findNextWordStart(this.input, this.inputCursor);
+          break;
+        case "b":
+          this.inputCursor = this.findPrevWordStart(this.input, this.inputCursor);
+          break;
+        case "e":
+          this.inputCursor = this.findCurrentWordEnd(this.input, this.inputCursor);
+          break;
+        case "G":
+          this.inputCursor = Math.max(0, this.input.length - 1);
+          break;
+      }
+
       this.render();
       return;
     }
 
     if (this.mode === "EDIT_NORMAL") {
-      const seq = key.sequence || "";
+      const seq = editKeyToken(key);
+
+      // Ctrl+W window navigation in EDIT_NORMAL
+      if (this.pendingCtrlW) {
+        this.pendingCtrlW = false;
+        const token = normalKeyToken(key);
+        if (token === "w" || (key.ctrl && key.name === "w")) {
+          this.switchPane();
+        } else if (token === "h" || key.name === "left") {
+          this.switchPane("title");
+        } else if (token === "l" || key.name === "right") {
+          this.switchPane("description");
+        } else if (token === "j" || key.name === "down") {
+          this.switchPane("notes");
+        } else if (token === "k" || key.name === "up") {
+          this.switchPane("description");
+        }
+        this.render();
+        return;
+      }
+      if (key.ctrl && key.name === "w") {
+        this.pendingCtrlW = true;
+        this.render();
+        return;
+      }
 
       // Single-character replacement mode: r<char>
       if (this.pendingEditOp === "r") {
@@ -1007,7 +1515,6 @@ export class OutlineEditorTUI {
           if (this.input.length > 0 && this.inputCursor < this.input.length) {
             this.pushTextUndo();
             this.input = this.input.slice(0, this.inputCursor) + seq + this.input.slice(this.inputCursor + 1);
-            this.modified = true;
           }
           this.pendingEditOp = "";
         }
@@ -1015,10 +1522,11 @@ export class OutlineEditorTUI {
         return;
       }
 
-      // Pending delete or change operator (dw, de, db, d$, d0, dd, cw, ce, cb, c$, c0, cc)
-      if (this.pendingEditOp === "d" || this.pendingEditOp === "c") {
+      // Pending delete, change, or yank operator (dw, de, db, d$, d0, dd, cw, ce, cb, c$, c0, cc, yw, ye, yb, y$, y0, yy)
+      if (this.pendingEditOp === "d" || this.pendingEditOp === "c" || this.pendingEditOp === "y") {
+        const isYank = this.pendingEditOp === "y";
         const isChange = this.pendingEditOp === "c";
-        const op = seq || key.name;
+        const op = editKeyToken(key);
         this.pendingEditOp = "";
 
         if (op === "escape") {
@@ -1029,34 +1537,54 @@ export class OutlineEditorTUI {
         const info = getCursorLineInfo(this.input, this.inputCursor);
 
         if (op === "w" || op === "e") {
-          this.pushTextUndo();
           const endIdx = op === "w"
             ? this.findNextWordStart(this.input, this.inputCursor)
             : this.findCurrentWordEnd(this.input, this.inputCursor);
-          // `e` is an inclusive motion: the char at endIdx is deleted too.
+          // `e` is an inclusive motion: the char at endIdx is included too.
           const sliceFrom = op === "e" ? endIdx + 1 : endIdx;
-          this.input = this.input.slice(0, this.inputCursor) + this.input.slice(sliceFrom);
-          if (isChange) this.mode = "INSERT";
-          this.modified = true;
+          if (isYank) {
+            this.clipboard = { text: this.input.slice(this.inputCursor, sliceFrom), isLinewise: false };
+            this.statusMessage = `Yanked ${this.clipboard.text.length} chars to clipboard`;
+            this.statusIsError = false;
+          } else {
+            this.pushTextUndo();
+            this.input = this.input.slice(0, this.inputCursor) + this.input.slice(sliceFrom);
+            if (isChange) this.mode = "INSERT";
+          }
         } else if (op === "b") {
-          this.pushTextUndo();
           const startIdx = this.findPrevWordStart(this.input, this.inputCursor);
-          this.input = this.input.slice(0, startIdx) + this.input.slice(this.inputCursor);
-          this.inputCursor = startIdx;
-          if (isChange) this.mode = "INSERT";
-          this.modified = true;
+          if (isYank) {
+            this.clipboard = { text: this.input.slice(startIdx, this.inputCursor), isLinewise: false };
+            this.statusMessage = `Yanked ${this.clipboard.text.length} chars to clipboard`;
+            this.statusIsError = false;
+          } else {
+            this.pushTextUndo();
+            this.input = this.input.slice(0, startIdx) + this.input.slice(this.inputCursor);
+            this.inputCursor = startIdx;
+            if (isChange) this.mode = "INSERT";
+          }
         } else if (op === "$" || op === "end") {
-          this.pushTextUndo();
-          this.input = this.input.slice(0, this.inputCursor) + this.input.slice(info.lineEnd);
-          if (isChange) this.mode = "INSERT";
-          this.modified = true;
+          if (isYank) {
+            this.clipboard = { text: this.input.slice(this.inputCursor, info.lineEnd), isLinewise: false };
+            this.statusMessage = `Yanked ${this.clipboard.text.length} chars to clipboard`;
+            this.statusIsError = false;
+          } else {
+            this.pushTextUndo();
+            this.input = this.input.slice(0, this.inputCursor) + this.input.slice(info.lineEnd);
+            if (isChange) this.mode = "INSERT";
+          }
         } else if (op === "0" || op === "^" || op === "home") {
-          this.pushTextUndo();
-          this.input = this.input.slice(0, info.lineStart) + this.input.slice(this.inputCursor);
-          this.inputCursor = info.lineStart;
-          if (isChange) this.mode = "INSERT";
-          this.modified = true;
-        } else if ((isChange && op === "c") || (!isChange && op === "d")) {
+          if (isYank) {
+            this.clipboard = { text: this.input.slice(info.lineStart, this.inputCursor), isLinewise: false };
+            this.statusMessage = `Yanked ${this.clipboard.text.length} chars to clipboard`;
+            this.statusIsError = false;
+          } else {
+            this.pushTextUndo();
+            this.input = this.input.slice(0, info.lineStart) + this.input.slice(this.inputCursor);
+            this.inputCursor = info.lineStart;
+            if (isChange) this.mode = "INSERT";
+          }
+        } else if ((isChange && op === "c") || (!isChange && !isYank && op === "d")) {
           this.pushTextUndo();
           if (this.editingMultiline && info.lines.length > 1) {
             if (info.line < info.lines.length - 1) {
@@ -1070,7 +1598,10 @@ export class OutlineEditorTUI {
             this.inputCursor = 0;
           }
           if (isChange) this.mode = "INSERT";
-          this.modified = true;
+        } else if (isYank && op === "y") {
+          this.clipboard = { text: info.lineText + "\n", isLinewise: true };
+          this.statusMessage = "Yanked 1 line to clipboard";
+          this.statusIsError = false;
         }
         this.render();
         return;
@@ -1102,7 +1633,7 @@ export class OutlineEditorTUI {
 
       const info = getCursorLineInfo(this.input, this.inputCursor);
 
-      switch (seq || key.name) {
+      switch (seq) {
         case "h":
         case "left":
           if (info.col > 0) this.inputCursor--;
@@ -1148,6 +1679,42 @@ export class OutlineEditorTUI {
           this.inputCursor = this.findCurrentWordEnd(this.input, this.inputCursor);
           break;
 
+        // Visual mode entry
+        case "v":
+          this.mode = "VISUAL";
+          this.visualType = "char";
+          this.visualAnchor = this.inputCursor;
+          break;
+        case "V":
+          this.mode = "VISUAL";
+          this.visualType = "line";
+          this.visualAnchor = this.inputCursor;
+          break;
+
+        // Clipboard operations
+        case "y":
+          this.pendingEditOp = "y";
+          break;
+        case "Y": {
+          const lineInfo = getCursorLineInfo(this.input, this.inputCursor);
+          this.clipboard = { text: lineInfo.lineText + "\n", isLinewise: true };
+          this.statusMessage = "Yanked 1 line to clipboard";
+          this.statusIsError = false;
+          break;
+        }
+        case "p":
+          this.pasteInEditMode(false);
+          break;
+        case "P":
+          this.pasteInEditMode(true);
+          break;
+
+        // Pane navigation
+        case "tab":
+          if (key.shift) this.switchPanePrev();
+          else this.switchPane();
+          break;
+
         // Enter INSERT mode (Level 3)
         case "i":
           this.mode = "INSERT";
@@ -1175,7 +1742,6 @@ export class OutlineEditorTUI {
             this.inputCursor = this.input.length;
           }
           this.mode = "INSERT";
-          this.modified = true;
           break;
         case "O":
           this.pushTextUndo();
@@ -1186,7 +1752,6 @@ export class OutlineEditorTUI {
             this.inputCursor = 0;
           }
           this.mode = "INSERT";
-          this.modified = true;
           break;
 
         // In-place edits
@@ -1196,7 +1761,6 @@ export class OutlineEditorTUI {
             this.pushTextUndo();
             this.input = this.input.slice(0, this.inputCursor) + this.input.slice(this.inputCursor + 1);
             if (this.inputCursor >= this.input.length && this.inputCursor > 0) this.inputCursor--;
-            this.modified = true;
           }
           break;
         case "X":
@@ -1205,7 +1769,6 @@ export class OutlineEditorTUI {
             this.pushTextUndo();
             this.input = this.input.slice(0, this.inputCursor - 1) + this.input.slice(this.inputCursor);
             this.inputCursor--;
-            this.modified = true;
           }
           break;
         case "s":
@@ -1214,14 +1777,12 @@ export class OutlineEditorTUI {
             this.input = this.input.slice(0, this.inputCursor) + this.input.slice(this.inputCursor + 1);
           }
           this.mode = "INSERT";
-          this.modified = true;
           break;
         case "S":
           this.pushTextUndo();
           this.input = this.input.slice(0, info.lineStart) + this.input.slice(info.lineEnd);
           this.inputCursor = info.lineStart;
           this.mode = "INSERT";
-          this.modified = true;
           break;
         case "D":
           this.pushTextUndo();
@@ -1230,13 +1791,11 @@ export class OutlineEditorTUI {
           if (this.input.length > 0 && this.inputCursor >= this.input.length) {
             this.inputCursor = this.input.length - 1;
           }
-          this.modified = true;
           break;
         case "C":
           this.pushTextUndo();
           this.input = this.input.slice(0, this.inputCursor) + this.input.slice(info.lineEnd);
           this.mode = "INSERT";
-          this.modified = true;
           break;
         case "~":
           if (this.input.length > 0 && this.inputCursor < this.input.length) {
@@ -1245,7 +1804,6 @@ export class OutlineEditorTUI {
             const flipped = ch === ch.toUpperCase() ? ch.toLowerCase() : ch.toUpperCase();
             this.input = this.input.slice(0, this.inputCursor) + flipped + this.input.slice(this.inputCursor + 1);
             if (this.inputCursor < info.lineEnd - 1) this.inputCursor++;
-            this.modified = true;
           }
           break;
         case "u":
@@ -1267,7 +1825,6 @@ export class OutlineEditorTUI {
           this.pushTextUndo();
           this.input = this.input.slice(0, this.inputCursor) + "\n" + this.input.slice(this.inputCursor);
           this.inputCursor++;
-          this.modified = true;
         } else {
           this.finishEdit();
         }
@@ -1280,13 +1837,11 @@ export class OutlineEditorTUI {
           this.pushTextUndo();
           this.input = this.input.slice(0, this.inputCursor - 1) + this.input.slice(this.inputCursor);
           this.inputCursor--;
-          this.modified = true;
         }
       } else if (key.name === "delete") {
         if (this.inputCursor < this.input.length) {
           this.pushTextUndo();
           this.input = this.input.slice(0, this.inputCursor) + this.input.slice(this.inputCursor + 1);
-          this.modified = true;
         }
       } else if (key.name === "left") {
         if (this.inputCursor > 0) this.inputCursor--;
@@ -1305,7 +1860,6 @@ export class OutlineEditorTUI {
           const startIdx = this.findPrevWordStart(this.input, this.inputCursor);
           this.input = this.input.slice(0, startIdx) + this.input.slice(this.inputCursor);
           this.inputCursor = startIdx;
-          this.modified = true;
         }
       } else if (key.ctrl && key.name === "u") {
         // Ctrl+U: delete from cursor to start of line (vim INSERT mode standard)
@@ -1314,7 +1868,6 @@ export class OutlineEditorTUI {
           const info = getCursorLineInfo(this.input, this.inputCursor);
           this.input = this.input.slice(0, info.lineStart) + this.input.slice(this.inputCursor);
           this.inputCursor = info.lineStart;
-          this.modified = true;
         }
       } else if (key.ctrl && key.name === "h") {
         // Ctrl+H: backspace (vim INSERT mode alias)
@@ -1322,12 +1875,10 @@ export class OutlineEditorTUI {
           this.pushTextUndo();
           this.input = this.input.slice(0, this.inputCursor - 1) + this.input.slice(this.inputCursor);
           this.inputCursor--;
-          this.modified = true;
         }
       } else if (isPrintable(key)) {
         this.input = this.input.slice(0, this.inputCursor) + key.sequence + this.input.slice(this.inputCursor);
         this.inputCursor += key.sequence!.length;
-        this.modified = true;
       }
       this.render();
       return;
@@ -1450,6 +2001,25 @@ export class OutlineEditorTUI {
       return;
     }
 
+    if (this.pendingCtrlW) {
+      this.pendingCtrlW = false;
+      const token = normalKeyToken(key);
+      if (token === "w" || token === "l" || key.name === "right") {
+        this.beginEdit("description");
+      } else if (token === "j" || key.name === "down") {
+        this.beginEdit("notes");
+      } else if (token === "h" || key.name === "left") {
+        this.beginEdit("title");
+      }
+      this.render();
+      return;
+    }
+    if (key.ctrl && key.name === "w") {
+      this.pendingCtrlW = true;
+      this.render();
+      return;
+    }
+
     const seq = key.sequence || "";
 
     if (key.name === "colon" || seq === ":") {
@@ -1460,7 +2030,7 @@ export class OutlineEditorTUI {
       return;
     }
 
-    // Multi-key sequences (gg, zc, zo, za, zM, zR)
+    // Multi-key sequences (gg, zc, zo, za, zM, zR, yy)
     if (this.pendingSequence === "g") {
       if (seq === "g") {
         this.jumpTop();
@@ -1477,7 +2047,12 @@ export class OutlineEditorTUI {
         this.outline.setAllCollapsed(false);
       }
       this.pendingSequence = "";
-    } else if (seq === "g" || seq === "z") {
+    } else if (this.pendingSequence === "y") {
+      if (seq === "y") {
+        this.yankCurrentNode();
+      }
+      this.pendingSequence = "";
+    } else if (seq === "g" || seq === "z" || seq === "y") {
       this.pendingSequence = seq;
     } else {
       this.pendingSequence = "";
@@ -1557,6 +2132,28 @@ export class OutlineEditorTUI {
         case "N":
           this.beginEdit("notes");
           break;
+        // beginEdit bails out when there is no node, so entering VISUAL is
+        // conditional on it having actually opened a buffer — otherwise the
+        // badge would read VISUAL over the previous node's stale text.
+        case "v":
+        case "V":
+          if (this.selectedNode) {
+            this.beginEdit("title");
+            this.mode = "VISUAL";
+            this.visualType = normalKeyToken(key) === "V" ? "line" : "char";
+            this.visualAnchor = 0;
+            this.inputCursor = Math.max(0, this.input.length - 1);
+          }
+          break;
+        case "Y":
+          this.yankCurrentNode();
+          break;
+        case "p":
+          this.pasteNode(false);
+          break;
+        case "P":
+          this.pasteNode(true);
+          break;
         case "d":
         case "x":
         case "delete":
@@ -1584,14 +2181,21 @@ export class OutlineEditorTUI {
     const arg = parts[1];
 
     if (cmd === "w" || cmd === "write") {
-      this.saveFile(arg);
+      this.saveFile(arg, false);
+    } else if (cmd === "w!" || cmd === "write!") {
+      this.saveFile(arg, true);
     } else if (cmd === "q" || cmd === "quit") {
       this.quit();
     } else if (cmd === "wq" || cmd === "x") {
-      this.saveFile(arg);
-      this.quit();
+      this.saveFile(arg, false);
+      if (!this.statusIsError) this.quit();
+    } else if (cmd === "wq!" || cmd === "x!") {
+      this.saveFile(arg, true);
+      this.quit(true);
     } else if (cmd === "e" || cmd === "edit" || cmd === "load") {
-      this.loadFile(arg || this.filename);
+      this.loadFile(arg || this.filename, false);
+    } else if (cmd === "e!" || cmd === "edit!" || cmd === "load!") {
+      this.loadFile(arg || this.filename, true);
     } else if (cmd === "m" || cmd === "md" || cmd === "markdown") {
       this.exportMarkdown(arg);
     } else if (cmd === "help") {
@@ -1604,13 +2208,221 @@ export class OutlineEditorTUI {
     }
   }
 
-  private saveFile(targetFile?: string): void {
+  private initFileWatcher(): void {
+    this.closeFileWatcher();
+    try {
+      if (fs.existsSync(this.filename)) {
+        this.fileMtimeMs = fs.statSync(this.filename).mtimeMs;
+      } else {
+        this.fileMtimeMs = 0;
+      }
+    } catch {
+      this.fileMtimeMs = 0;
+    }
+
+    try {
+      const fullPath = path.resolve(this.filename);
+      const dir = path.dirname(fullPath);
+      const base = path.basename(fullPath);
+      if (fs.existsSync(dir)) {
+        this.fileWatcher = fs.watch(dir, (_event, changedFile) => {
+          if (changedFile && changedFile !== base) return;
+          this.onFileChangedOnDisk();
+        });
+      }
+    } catch {
+      this.fileWatcher = null;
+    }
+  }
+
+  private closeFileWatcher(): void {
+    if (this.fileWatcher) {
+      try {
+        this.fileWatcher.close();
+      } catch {}
+      this.fileWatcher = null;
+    }
+    if (this.reloadDebounceTimer) {
+      clearTimeout(this.reloadDebounceTimer);
+      this.reloadDebounceTimer = null;
+    }
+  }
+
+  /**
+   * Where the selection points, in terms that survive a reparse.
+   *
+   * Node ids are regenerated positionally by `fromMarkdown` (`node-1`,
+   * `node-2`, ...), so they identify a *slot*, not a node: insert a heading
+   * externally above the cursor and the old id still resolves — to the wrong
+   * node. The heading path is stable under that edit, so it is tried first,
+   * with the slot kept only as a fallback for a genuine rename.
+   */
+  private selectionAnchor(): { titlePath: string[]; index: number } | null {
+    const node = this.selectedNode;
+    if (!node) return null;
+    const titlePath: string[] = [];
+    let cur: OutlineNode | null = node;
+    while (cur && cur.id !== "root") {
+      titlePath.unshift(cur.title);
+      cur = this.outline.findParent(this.outline.root, cur.id);
+    }
+    return { titlePath, index: this.currentIndex };
+  }
+
+  private restoreSelection(anchor: { titlePath: string[]; index: number } | null): void {
+    if (!anchor) {
+      this.clampSelection();
+      return;
+    }
+    const visible = this.visibleNodes;
+    const pathOf = (node: OutlineNode): string[] => {
+      const out: string[] = [];
+      let cur: OutlineNode | null = node;
+      while (cur && cur.id !== "root") {
+        out.unshift(cur.title);
+        cur = this.outline.findParent(this.outline.root, cur.id);
+      }
+      return out;
+    };
+    const key = anchor.titlePath.join("\u0000");
+    const byPath = visible.findIndex((n) => pathOf(n).join("\u0000") === key);
+    this.currentIndex = byPath >= 0 ? byPath : anchor.index;
+    this.clampSelection();
+  }
+
+  /**
+   * Pull the file back in over a clean buffer.
+   *
+   * The undo history is dropped rather than kept: its snapshots predate the
+   * reload, so a single `u` afterwards would restore the pre-reload tree and
+   * silently discard whatever the external writer had just added — and mark
+   * the result dirty, so the next `:w` would write that loss back out.
+   */
+  private applyReloadFromDisk(mtimeMs: number): boolean {
+    try {
+      const data = fs.readFileSync(this.filename, "utf8");
+      const anchor = this.selectionAnchor();
+      if (/^\s*\{/.test(data)) this.outline.fromJSON(data);
+      else this.outline.fromMarkdown(data);
+
+      this.restoreSelection(anchor);
+      this.undoStack = [];
+      this.redoStack = [];
+      this.markSaved();
+      this.fileMtimeMs = mtimeMs;
+      this.diskFileModified = false;
+      this.pendingReload = false;
+      this.statusMessage = `⟳ Auto-reloaded ${path.basename(this.filename)} (external changes detected)`;
+      this.statusIsError = false;
+      return true;
+    } catch (err) {
+      this.statusMessage = `✗ Error auto-reloading: ${err instanceof Error ? err.message : String(err)}`;
+      this.statusIsError = true;
+      return false;
+    }
+  }
+
+  /** Editing modes hold text outside the tree, so a reload waits them out. */
+  private get reloadIsSafeNow(): boolean {
+    return this.mode === "NORMAL" || this.mode === "COMMAND";
+  }
+
+  /**
+   * Run a reload that arrived while the user was inside an edit mode. Called
+   * on every return to NORMAL, so a deferred refresh lands as soon as it is
+   * safe instead of waiting for the next external write.
+   */
+  private applyPendingReload(): void {
+    if (!this.pendingReload || !this.reloadIsSafeNow || this.closed) return;
+    this.pendingReload = false;
+
+    // The buffer may have been edited between the deferral and now, or the
+    // file may be gone. Either way the refresh is off — but it must degrade
+    // into the conflict guard, not vanish: dropping it silently would leave
+    // the next :w free to overwrite the external change without a warning.
+    let mtime = 0;
+    const exists = fs.existsSync(this.filename);
+    if (exists) {
+      try {
+        mtime = fs.statSync(this.filename).mtimeMs;
+      } catch {
+        return;
+      }
+    }
+    if (!exists || this.modified) {
+      this.diskFileModified = true;
+      this.statusMessage = exists
+        ? `⚠ File changed on disk! Local changes pending.`
+        : `⚠ File ${path.basename(this.filename)} was deleted externally!`;
+      this.statusIsError = true;
+      return;
+    }
+    this.applyReloadFromDisk(mtime);
+  }
+
+  private onFileChangedOnDisk(): void {
+    if (this.reloadDebounceTimer) clearTimeout(this.reloadDebounceTimer);
+    this.reloadDebounceTimer = setTimeout(() => {
+      this.reloadDebounceTimer = null;
+      if (this.closed) return;
+
+      if (!fs.existsSync(this.filename)) {
+        // Worth saying even over a clean buffer: the next :w recreates the
+        // file, and silence would make that look like an ordinary save.
+        this.diskFileModified = true;
+        this.statusMessage = `⚠ File ${path.basename(this.filename)} was deleted externally!`;
+        this.statusIsError = true;
+        this.render();
+        return;
+      }
+
+      let currentMtime = 0;
+      try {
+        currentMtime = fs.statSync(this.filename).mtimeMs;
+      } catch {
+        return;
+      }
+
+      if (this.fileMtimeMs > 0 && currentMtime <= this.fileMtimeMs) {
+        return;
+      }
+
+      if (this.modified) {
+        this.diskFileModified = true;
+        this.statusMessage = `⚠ File changed on disk! Local changes pending.`;
+        this.statusIsError = true;
+      } else if (this.reloadIsSafeNow) {
+        this.applyReloadFromDisk(currentMtime);
+      } else {
+        // Clean, but the edit buffer is open: defer until it closes.
+        this.pendingReload = true;
+        this.statusMessage = `⟳ ${path.basename(this.filename)} changed on disk — reloading when you leave edit mode`;
+        this.statusIsError = false;
+      }
+      this.render();
+    }, 50);
+  }
+
+  private saveFile(targetFile?: string, force: boolean = false): void {
     // A legacy .json input is migrated to a Markdown file instead of being
     // silently overwritten with a different format.
     const file = targetFile || (/\.json$/i.test(this.filename)
       ? this.filename.replace(/\.json$/i, ".md")
       : this.filename);
     try {
+      let currentMtime = 0;
+      if (fs.existsSync(file)) {
+        try {
+          currentMtime = fs.statSync(file).mtimeMs;
+        } catch {}
+      }
+
+      if (!force && (this.diskFileModified || (this.fileMtimeMs > 0 && currentMtime > this.fileMtimeMs))) {
+        this.statusMessage = "✗ Conflict: File modified externally! Use :w! to overwrite or :e! to reload.";
+        this.statusIsError = true;
+        return;
+      }
+
       // The rename replaces the inode, so carry the original mode over instead
       // of silently tightening permissions on every save.
       let mode = 0o600;
@@ -1622,8 +2434,20 @@ export class OutlineEditorTUI {
       const tempPath = `${file}.tmp-${process.pid}`;
       fs.writeFileSync(tempPath, this.outline.toMarkdown(), { encoding: "utf8", mode });
       fs.renameSync(tempPath, file);
-      this.filename = file;
-      this.modified = false;
+
+      try {
+        this.fileMtimeMs = fs.statSync(file).mtimeMs;
+      } catch {
+        this.fileMtimeMs = Date.now();
+      }
+
+      if (file !== this.filename) {
+        this.filename = file;
+        this.initFileWatcher();
+      }
+
+      this.markSaved();
+      this.diskFileModified = false;
       this.statusMessage = `✓ Saved to ${file}`;
       this.statusIsError = false;
     } catch (err) {
@@ -1632,7 +2456,12 @@ export class OutlineEditorTUI {
     }
   }
 
-  private loadFile(file: string): void {
+  private loadFile(file: string, force: boolean = false): void {
+    if (!force && this.modified) {
+      this.statusMessage = "✗ Unsaved changes! Use :e! to discard changes and reload.";
+      this.statusIsError = true;
+      return;
+    }
     try {
       if (fs.existsSync(file)) {
         const data = fs.readFileSync(file, "utf8");
@@ -1641,7 +2470,10 @@ export class OutlineEditorTUI {
         this.filename = file;
         this.currentIndex = 0;
         this.scrollOffset = 0;
-        this.modified = false;
+        this.markSaved();
+        this.diskFileModified = false;
+        this.pendingReload = false;
+        this.initFileWatcher();
         this.statusMessage = `✓ Loaded from ${file}`;
         this.statusIsError = false;
       } else {
@@ -1660,7 +2492,7 @@ export class OutlineEditorTUI {
     const file = targetFile || this.filename.replace(/(\.[^./\\]*)?$/, ".md");
     try {
       fs.writeFileSync(file, this.outline.toMarkdown(), "utf8");
-      if (file === this.filename) this.modified = false;
+      if (file === this.filename) this.markSaved();
       this.statusMessage = `✓ Exported markdown to ${file}`;
       this.statusIsError = false;
     } catch (err) {
@@ -1677,11 +2509,14 @@ export class OutlineEditorTUI {
     const buffer: string[] = [];
 
     // Header bar
-    const modTag = this.modified ? " \x1b[33m[+Modified]\x1b[0m" : "";
+    const modTag = (this.modified ? " \x1b[33m[+Modified]\x1b[0m" : "") +
+                   (this.diskFileModified ? " \x1b[31m[Disk Modified]\x1b[0m" : "");
     let modeBadge = "\x1b[42;30m OUTLINE \x1b[0m";
-    const fieldTag = this.editField === "notes" ? "NOTE" : "DESC";
+    const fieldTag = this.editField === "notes" ? "NOTE" : this.editField === "description" ? "DESC" : "TITLE";
     if (this.mode === "EDIT_NORMAL") {
       modeBadge = this.editingMultiline ? `\x1b[44;37m ${fieldTag}-NAV \x1b[0m` : "\x1b[44;37m EDIT-NAV \x1b[0m";
+    } else if (this.mode === "VISUAL") {
+      modeBadge = this.editingMultiline ? `\x1b[45;37m ${fieldTag}-VIS \x1b[0m` : "\x1b[45;37m EDIT-VIS \x1b[0m";
     } else if (this.mode === "INSERT") {
       modeBadge = this.editingMultiline ? `\x1b[45;37m ${fieldTag}-INS \x1b[0m` : "\x1b[43;30m INSERT \x1b[0m";
     } else if (this.mode === "COMMAND") {
@@ -1691,7 +2526,7 @@ export class OutlineEditorTUI {
     const headerLeftBase = " \x1b[1mOUTLINE EDITOR\x1b[0m  \x1b[36m";
     const headerRight = `${modeBadge} `;
     const rightLen = stringWidth(headerRight);
-    const maxFileLen = Math.max(8, cols - 20 - rightLen - (this.modified ? 12 : 0));
+    const maxFileLen = Math.max(8, cols - 20 - rightLen - (this.modified ? 12 : 0) - (this.diskFileModified ? 16 : 0));
     const dispFile = this.filename.length > maxFileLen ? `...${this.filename.slice(-(maxFileLen - 3))}` : this.filename;
     const headerLeft = `${headerLeftBase}${dispFile}\x1b[0m${modTag}`;
     const leftLen = stringWidth(headerLeft);
@@ -1730,7 +2565,7 @@ export class OutlineEditorTUI {
     // field is being edited the pane switches to a focus layout — metadata
     // collapses to the title and the other field to a single row — so the text
     // under the cursor gets nearly the whole pane instead of five or six rows.
-    const editingField = this.mode === "EDIT_NORMAL" || this.mode === "INSERT" ? this.editField : null;
+    const editingField = this.mode === "EDIT_NORMAL" || this.mode === "INSERT" || this.mode === "VISUAL" ? this.editField : null;
     const focused = editingField === "description" || editingField === "notes";
 
     const overflowTag = (block: { above: number; below: number }): string => {
@@ -1857,12 +2692,38 @@ export class OutlineEditorTUI {
         const availTitleW = Math.max(1, leftWidth - prefixW);
 
         let titleStr = node.title || "(empty)";
-        if (isSelected && (this.mode === "EDIT_NORMAL" || this.mode === "INSERT") && !this.editingMultiline) {
-          const cur = Math.max(0, Math.min(this.inputCursor, this.input.length));
-          const before = this.input.slice(0, cur);
-          const cursorChar = cur < this.input.length ? this.input[cur] : " ";
-          const after = cur < this.input.length ? this.input.slice(cur + 1) : "";
-          titleStr = `${before}\x1b[7m${cursorChar}\x1b[0m${after}`;
+        if (isSelected && (this.mode === "EDIT_NORMAL" || this.mode === "INSERT" || this.mode === "VISUAL") && !this.editingMultiline) {
+          if (this.mode === "VISUAL") {
+            const sel = this.getSelectionRange();
+            let formatted = "";
+            let inSel = false;
+            for (let i = 0; i < this.input.length; i++) {
+              const ch = this.input[i];
+              const isCursor = i === this.inputCursor;
+              const isSelectedChar = i >= sel.start && i <= sel.end;
+              if (isCursor) {
+                if (inSel) { formatted += "\x1b[0m"; inSel = false; }
+                formatted += `\x1b[7;1m${ch}\x1b[0m`;
+              } else if (isSelectedChar) {
+                if (!inSel) { formatted += "\x1b[48;5;24;37m"; inSel = true; }
+                formatted += ch;
+              } else {
+                if (inSel) { formatted += "\x1b[0m"; inSel = false; }
+                formatted += ch;
+              }
+            }
+            if (inSel) { formatted += "\x1b[0m"; inSel = false; }
+            if (this.inputCursor >= this.input.length) {
+              formatted += `\x1b[7;1m \x1b[0m`;
+            }
+            titleStr = formatted;
+          } else {
+            const cur = Math.max(0, Math.min(this.inputCursor, this.input.length));
+            const before = this.input.slice(0, cur);
+            const cursorChar = cur < this.input.length ? this.input[cur] : " ";
+            const after = cur < this.input.length ? this.input.slice(cur + 1) : "";
+            titleStr = `${before}\x1b[7m${cursorChar}\x1b[0m${after}`;
+          }
         }
 
         const truncatedTitle = truncateToWidth(titleStr, availTitleW, true);
@@ -1893,7 +2754,15 @@ export class OutlineEditorTUI {
 
     // Status / Prompt line
     let statusLine = "";
-    if (this.mode === "EDIT_NORMAL" || this.mode === "INSERT") {
+    if (this.mode === "VISUAL") {
+      const fieldName = this.editField === "notes" ? "NOTES" : this.editField === "description" ? "DESC" : "TITLE";
+      const sel = this.getSelectionRange();
+      const countDesc = sel.isLinewise
+        ? `${sel.text.split("\n").filter((_, idx, arr) => idx < arr.length - 1 || arr[idx].length > 0).length} lines`
+        : `${sel.text.length} chars`;
+      const typeDesc = this.visualType === "line" ? "LINE" : "CHAR";
+      statusLine = ` \x1b[1;35mVISUAL (${typeDesc}) ${fieldName}:\x1b[0m \x1b[1m[${countDesc} selected]\x1b[0m \x1b[2m[y:Yank d:Cut p:Paste o:SwapEnd Tab:Pane Esc:Cancel]\x1b[0m`;
+    } else if (this.mode === "EDIT_NORMAL" || this.mode === "INSERT") {
       const fieldName = this.editField === "notes" ? "NOTES" : this.editField === "description" ? "DESC" : "TITLE";
       const nav = this.mode === "EDIT_NORMAL";
       const promptLabel = `EDIT ${fieldName} (${nav ? "NAV" : "INSERT"}): `;
@@ -1906,7 +2775,7 @@ export class OutlineEditorTUI {
         : Math.max(0, Math.min(this.inputCursor, echo.length));
       const cursorChar = cur < echo.length ? echo[cur] : " ";
       const displayLine = this.editingMultiline ? `[Line ${info.line + 1}/${info.lines.length}] ` : "";
-      const hint = nav ? "[h/l:Move w/b:Word i/a:Insert Esc/Enter:Done]" : "[Esc: Nav Mode | Enter: Confirm]";
+      const hint = nav ? "[h/l:Move w/b:Word v:Visual Tab:Pane Esc/Enter:Done]" : "[Esc: Nav Mode | Enter: Confirm]";
       const color = nav ? "\x1b[1;34m" : "\x1b[1;33m";
       statusLine = ` ${color}${promptLabel}\x1b[0m${displayLine}\x1b[1m${echo.slice(0, cur)}\x1b[7m${cursorChar}\x1b[0m\x1b[1m${echo.slice(cur + 1)}\x1b[0m \x1b[2m${hint}\x1b[0m`;
     } else if (this.mode === "COMMAND") {
@@ -1921,14 +2790,16 @@ export class OutlineEditorTUI {
 
     // Footer hints line
     let footerHints = "";
-    if (this.mode === "EDIT_NORMAL") {
-      footerHints = " h/l:Move  w/b/e:Word  0/$:LineEnd  i/a/A:Insert  x:Del  cw/de:Change  r:Replace  u:Undo  Esc/Enter:Done";
+    if (this.mode === "VISUAL") {
+      footerHints = " y:Yank  d/x:Cut  c:Change  p:Paste  o:SwapCursor  w/b/e:Word  0/$:LineEnd  Tab:Pane  Esc:Cancel";
+    } else if (this.mode === "EDIT_NORMAL") {
+      footerHints = " h/l:Move  w/b/e:Word  v/V:Visual  yw/yy:Yank  p/P:Paste  Tab:Pane  cw/de:Change  u:Undo  Esc:Done";
     } else if (this.mode === "INSERT") {
       footerHints = ` Type to edit  BS:Delete  Ctrl+W:DelWord  Ctrl+U:DelLine  Esc:NavMode  Enter:${this.editingMultiline ? "Newline" : "Confirm"}`;
     } else if (this.mode === "COMMAND") {
       footerHints = " Enter:Execute  Esc:Cancel  ↑/↓:History  ← →:Move";
     } else {
-      footerHints = " j/k:Move  Ctrl+F/B:Page  h/l:Fold  J/K:Reorder  Tab:Indent  o/c:New  e/R:Edit  E:Desc  N:Notes  d:Del  u:Undo  :w:Save  ?:Help  q:Quit";
+      footerHints = " j/k:Move  h/l:Fold  o/c:New  e/E/N:Edit  v/y/p:Clip  d:Del  u:Undo  ?:Help  Tab:Indent  J/K:Reorder";
     }
     const truncatedFooter = truncateToWidth(`\x1b[2m${footerHints}\x1b[0m`, cols, false);
     const footerPad = Math.max(0, cols - stringWidth(truncatedFooter));
@@ -1957,22 +2828,43 @@ export class OutlineEditorTUI {
       "║    Tab / >        Indent (demote)   Shift+Tab / <  Dedent (promote)  ║",
       "║    e / R / Enter  Edit title        i  Edit title → INSERT           ║",
       "║    E / N          Edit description / speaker notes                   ║",
+      "║    v / V          Visual text selection on title                     ║",
+      "║    yy / Y         Yank node title to clipboard                       ║",
+      "║    p / P          Paste clipboard as new sibling below / above       ║",
       "║    o / O          New sibling below / above  → INSERT                ║",
       "║    c              New child  → INSERT                                ║",
-      "║    d / x          Delete node + descendants                          ║",
-      "║    u / Ctrl+R     Undo / Redo   q  Quit   ?  Toggle this help        ║",
+      "║    d / x          Delete node       u / Ctrl+R   Undo / Redo         ║",
+      "║    q              Quit              ?            Toggle this help    ║",
       "║                                                                      ║",
       "║  EDIT-NAV MODE  (vim motions on node text)                           ║",
-      "║    Standard vim: h/l/w/b/e/0/$ move; d/c/D/C/x/X/r/~/s/S edit        ║",
-      "║    i/a/I/A/o/O → INSERT    u / Ctrl+R  undo/redo text                ║",
-      "║    Ctrl+W  delete word back    Ctrl+U  delete to line start          ║",
-      "║    Esc / Enter  confirm & return to NORMAL                           ║",
-      "║    j / k  move logical line (description / notes); long lines wrap   ║",
-      "║    Editing a description or notes expands the right-hand pane        ║",
+      "║    h/l/w/b/e/0/$ move; d/c/D/C/x/X/r/~/s/S edit; i/a/I/A/o/O insert  ║",
+      "║    v / V          Start characterwise / linewise visual selection    ║",
+      "║    yw / ye / yy   Yank word / line to app-internal clipboard         ║",
+      "║    p / P          Paste clipboard after / before cursor              ║",
+      "║    Tab / S-Tab    Cycle pane (Title ↔ Description ↔ Notes)           ║",
+      "║    Ctrl+W w       Cycle pane;  Ctrl+W h/l/j/k direct pane jump       ║",
+      "║    j / k          Move by logical line (description / notes); a      ║",
+      "║                   wrapped line is stepped over whole, as in vim      ║",
+      "║    Esc / Enter    Confirm and return to NORMAL                       ║",
+      "║    Editing description / notes expands the right-hand pane; the      ║",
+      "║    arrows on a label (Description: ↑3 ↓12) count rows off-screen     ║",
       "║                                                                      ║",
-      "║  COMMANDS  (:)   ↑/↓ browse history   ← → move cursor                ║",
-      "║    :w  save   :q  quit   :q!  force quit   :wq  save & quit          ║",
-      "║    :e <file>  open    :m [file]  export Markdown                     ║",
+      "║  VISUAL MODE  (text selection across every pane)                     ║",
+      "║    h/j/k/l/w/b/e  Extend selection  │  o  Swap cursor / anchor ends  ║",
+      "║    0 / $ / gg / G Extend to line start / end, field start / end      ║",
+      "║    y              Yank selection to clipboard                        ║",
+      "║    d / x          Cut selection to clipboard                         ║",
+      "║    c / s          Change selection (cut and enter INSERT)            ║",
+      "║    p / P          Replace selection with clipboard content           ║",
+      "║    v / V / Esc    Toggle mode / Cancel visual selection              ║",
+      "║                                                                      ║",
+      "║  FILESYSTEM & COMMANDS  (:)                                          ║",
+      "║    Auto-reloads when clean; a reload arriving mid-edit is applied    ║",
+      "║    on return to NORMAL. Warns instead when local edits are pending   ║",
+      "║    :w  save   :w!  force save (overwrite external disk changes)      ║",
+      "║    :q  quit   :q!  force quit   :wq / :wq!  save & quit              ║",
+      "║    :e <file>  open file         :e!  discard local edits & reload    ║",
+      "║    :m [file]  export Markdown                                        ║",
       "╚══════════════════════════════════════════════════════════════════════╝",
     ];
 
@@ -1983,12 +2875,21 @@ export class OutlineEditorTUI {
     for (let i = 0; i < topPad; i++) {
       buffer.push(" ".repeat(cols));
     }
-    for (const line of modalLines) {
+    // The box is taller than a 24-row terminal, so it scrolls rather than
+    // running off the bottom of the screen and taking the layout with it.
+    const viewport = Math.max(1, rows - topPad - 1);
+    const maxScroll = Math.max(0, modalLines.length - viewport);
+    this.helpScroll = Math.min(Math.max(0, this.helpScroll), maxScroll);
+    const visibleLines = modalLines.slice(this.helpScroll, this.helpScroll + viewport);
+    for (const line of visibleLines) {
       const truncated = truncateToWidth(line, modalWidth, false);
       const rightPad = Math.max(0, cols - boxLeftPad - stringWidth(truncated));
       buffer.push(`${" ".repeat(boxLeftPad)}\x1b[1;37m${truncated}\x1b[0m${" ".repeat(rightPad)}`);
     }
-    const footerText = " Press ? or Escape to return to editor ";
+    const scrollTag = maxScroll > 0
+      ? ` ${this.helpScroll > 0 ? "↑" : " "}${this.helpScroll < maxScroll ? "↓" : " "} j/k scroll `
+      : "";
+    const footerText = `${scrollTag} Press ? or Escape to return to editor `;
     const truncatedFooterText = truncateToWidth(footerText, cols, false);
     const footerWidth = stringWidth(truncatedFooterText);
     const footerLeftPad = Math.max(0, Math.floor((cols - footerWidth) / 2));
@@ -2008,7 +2909,8 @@ export class OutlineEditorTUI {
    * offset is mapped through the wrap so it lands on the right visual row, and
    * the window scrolls vertically to keep that row on screen. Motions still
    * operate on logical lines — `j`/`k` step over a wrapped line as a whole,
-   * the way vim does without `gj`/`gk`.
+   * the way vim does without `gj`/`gk`. A visual selection is painted through
+   * the same mapping, so a highlight spans continuation rows unbroken.
    *
    * Returns the count of rows hidden above and below so the caller can flag
    * the overflow on the section label instead of spending a row on it.
@@ -2062,10 +2964,50 @@ export class OutlineEditorTUI {
     }
     const last = Math.min(rows.length, first + height);
 
+    const lineOffsets: number[] = [];
+    let curOff = 0;
+    for (let i = 0; i < logical.length; i++) {
+      lineOffsets.push(curOff);
+      curOff += logical[i].length + 1;
+    }
+
     const out: string[] = [];
     for (let ri = first; ri < last; ri++) {
       const row = rows[ri];
       const pad = " ".repeat(row.indent);
+
+      if (editing && this.mode === "VISUAL") {
+        const sel = this.getSelectionRange();
+        const lineStart = lineOffsets[row.line];
+        const rowCharAbsStart = lineStart + row.start;
+        let rowFormatted = "";
+        let inSel = false;
+        for (let col = 0; col < row.text.length; col++) {
+          const absIdx = rowCharAbsStart + col;
+          const isSelected = absIdx >= sel.start && absIdx <= sel.end;
+          const isCursor = absIdx === this.inputCursor;
+          const ch = row.text[col];
+
+          if (isCursor) {
+            if (inSel) { rowFormatted += "\x1b[0m"; inSel = false; }
+            rowFormatted += `\x1b[7;1m${ch}\x1b[0m`;
+          } else if (isSelected) {
+            if (!inSel) { rowFormatted += "\x1b[48;5;24;37m"; inSel = true; }
+            rowFormatted += ch;
+          } else {
+            if (inSel) { rowFormatted += "\x1b[0m"; inSel = false; }
+            rowFormatted += ch;
+          }
+        }
+        if (inSel) { rowFormatted += "\x1b[0m"; inSel = false; }
+
+        if (ri === cursorRow && cursorCol >= row.text.length) {
+          rowFormatted += `\x1b[7;1m \x1b[0m`;
+        }
+        out.push(truncateToWidth(pad + rowFormatted, width, false));
+        continue;
+      }
+
       if (ri !== cursorRow) {
         out.push(truncateToWidth(pad + row.text, width, false));
         continue;
@@ -2113,6 +3055,7 @@ export class OutlineEditorTUI {
       return;
     }
 
+    this.closeFileWatcher();
     this.closed = true;
 
     if (process.stdin.isTTY) {
@@ -2154,6 +3097,11 @@ DESCRIPTION
   save. If FILE does not exist, a starter outline is created in memory. Changes remain in memory
   until saved via :w or Ctrl+S.
 
+  Auto-reloads external changes from the filesystem when no local edits are pending.
+  A change arriving while a node is open for editing is applied on the return to
+  NORMAL, so the edit buffer is never swapped out from under the cursor.
+  Warns and blocks save on conflict if the file was modified externally.
+
 OPTIONS
   -h, --help       Print this help text and exit
   -v, --version    Print the version number and exit
@@ -2172,6 +3120,9 @@ KEYBOARD SHORTCUTS
     i              Edit title → INSERT mode directly
     E              Edit description (→ INSERT if currently empty)
     N              Edit speaker notes (→ INSERT if currently empty)
+    v / V          Visual text selection on title
+    yy / Y         Yank node title to clipboard
+    p / P          Paste clipboard as new sibling below / above
     o / O          New sibling below / above → INSERT
     c              New child → INSERT
     d / x          Delete node and all descendants
@@ -2179,29 +3130,49 @@ KEYBOARD SHORTCUTS
     q              Quit (warns if unsaved)    ?  Toggle help overlay
 
   EDIT-NAV MODE  (vim normal-mode motions on the node text)
-    Standard vim motions and operators apply: h/l/w/b/e/0/$  move;
-    d/c/D/C/x/X/r/~/s/S  edit;  i/a/I/A/o/O → INSERT.
+    Standard vim motions and operators apply: h/l/w/b/e/0/$ move;
+    d/c/D/C/x/X/r/~/s/S edit; i/a/I/A/o/O → INSERT.
+    v / V          Start characterwise / linewise visual selection
+    yw / ye / yy   Yank word / line to single-slot clipboard
+    p / P          Paste clipboard after / before cursor
+    Tab / Shift+Tab Cycle active pane (Title ↔ Description ↔ Notes)
+    Ctrl+W w       Cycle active pane (Ctrl+W h/l/j/k for directional jump)
     j / k          Move cursor to next / previous logical line (description /
                    notes). Long lines are soft-wrapped onto continuation rows,
                    so j / k step over a wrapped line as a whole, as in vim
                    without gj / gk.
+    Ctrl+W         Delete word backward (in INSERT)
+    Ctrl+U         Delete to beginning of line (in INSERT)
+    Esc / Enter    Confirm and return to NORMAL mode
 
   While a description or notes field is being edited, the right-hand pane
   switches to a focus layout: the metadata collapses to the title and the other
   field to a single row, so the text being edited gets nearly the whole pane.
   Arrows on a section label (for example \`Description: ↑3 ↓12\`) count the rows
   scrolled out of view above and below.
-    Ctrl+W         Delete word backward (also works in INSERT)
-    Ctrl+U         Delete to beginning of line (also works in INSERT)
-    Esc / Enter    Confirm and return to NORMAL mode
+
+  VISUAL MODE  (text selection across every pane)
+    h / j / k / l  Extend selection by char / line
+    w / b / e      Extend selection by word start / prev / word end
+    0 / $ / gg / G Extend selection to line start / end / file start / end
+    o              Swap cursor and anchor ends of selection
+    y              Yank selection to clipboard
+    d / x          Cut selection to clipboard
+    c / s          Cut selection and enter INSERT mode
+    p / P          Replace selection with clipboard content
+    v / V / Esc    Toggle mode / Cancel visual selection
+    Tab / Shift+Tab Switch pane
 
   COMMANDS  (:)
     ↑ / ↓          Browse command history
-    :w / Ctrl+S    Save as Markdown slides
+    :w / Ctrl+S    Save as Markdown slides (warns if disk file changed)
+    :w!            Force save (overwrite external disk modifications)
     :q             Quit (warns if unsaved)
     :q!            Force quit without saving
     :wq            Save and quit
-    :e <file>      Open another file
+    :wq!           Force save and quit
+    :e <file>      Open another file (warns if unsaved changes exist)
+    :e!            Force reload from disk (discard local edits)
     :m [file]      Export outline to Markdown
 
 FILE FORMAT
