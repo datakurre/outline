@@ -818,9 +818,9 @@ async function runTests() {
     });
 
     // ----------------------------------------------------
-    // Frontmatter & Conference Metadata
+    // Frontmatter Metadata
     // ----------------------------------------------------
-    await test("Frontmatter parses title, subtitle, author, institute, date, conference with aliases and extraLines", () => {
+    await test("Frontmatter parses supported fields and preserves unknown lines", () => {
       const markdown = [
         "---",
         "title: 'Scalable Systems'",
@@ -843,16 +843,15 @@ async function runTests() {
       assert.strictEqual(outline.metadata.subtitle, "Architecture and Design");
       assert.strictEqual(outline.metadata.author, "Jane Doe");
       assert.strictEqual(outline.metadata.institute, "Acme Corp"); // parsed from organization
-      assert.strictEqual(outline.metadata.conference, "TechConf 2026"); // parsed from event
       assert.strictEqual(outline.metadata.date, "2026-09-07");
-      assert.deepStrictEqual(outline.metadata.extraLines, ["theme: solarized", "aspectratio: 169"]);
+      assert.deepStrictEqual(outline.metadata.extraLines, ["event: TechConf 2026", "theme: solarized", "aspectratio: 169"]);
 
       const serialized = outline.toMarkdown();
       assert.ok(serialized.includes("title: Scalable Systems"));
       assert.ok(serialized.includes("subtitle: Architecture and Design"));
       assert.ok(serialized.includes("author: Jane Doe"));
       assert.ok(serialized.includes("institute: Acme Corp"));
-      assert.ok(serialized.includes("conference: TechConf 2026"));
+      assert.ok(serialized.includes("event: TechConf 2026"));
       assert.ok(serialized.includes("theme: solarized"));
       assert.ok(serialized.includes("aspectratio: 169"));
       assert.ok(serialized.includes("# First Slide"));
@@ -942,22 +941,14 @@ async function runTests() {
       editor.dispatchKey({ name: "tab" });
       assert.strictEqual(editor.getEditField(), "date");
 
-      // Press Tab to cycle to conference
-      editor.dispatchKey({ name: "tab" });
-      assert.strictEqual(editor.getEditField(), "conference");
-      editor.dispatchKey({ sequence: "i" });
-      for (const ch of "Conf 2026") editor.dispatchKey({ sequence: ch });
-      editor.dispatchKey({ name: "escape" });
-
       // Press Tab to cycle back to title
       editor.dispatchKey({ name: "tab" });
       assert.strictEqual(editor.getEditField(), "title");
       assert.strictEqual(editor.getInput(), "Keynote Talk");
 
-      // Press Shift+Tab to cycle backward to conference
+      // Press Shift+Tab to cycle backward to date
       editor.dispatchKey({ name: "tab", shift: true });
-      assert.strictEqual(editor.getEditField(), "conference");
-      assert.strictEqual(editor.getInput(), "Conf 2026");
+      assert.strictEqual(editor.getEditField(), "date");
 
       // Press Enter to confirm and return to NORMAL
       editor.dispatchKey({ name: "return" });
@@ -965,7 +956,6 @@ async function runTests() {
       assert.strictEqual(editor.getMetadata().title, "Keynote Talk");
       assert.strictEqual(editor.getMetadata().subtitle, "Future of Systems");
       assert.strictEqual(editor.getMetadata().author, "Bob Smith");
-      assert.strictEqual(editor.getMetadata().conference, "Conf 2026");
       assert.strictEqual(editor.isModified(), true);
 
       (editor as any).quit(true);
@@ -998,13 +988,9 @@ async function runTests() {
       editor.dispatchKey({ name: "down" });
       assert.strictEqual(editor.getEditField(), "date");
 
-      // j moves to conference
+      // j at bottom field stays on date
       editor.dispatchKey({ sequence: "j" });
-      assert.strictEqual(editor.getEditField(), "conference");
-
-      // j at bottom field stays on conference
-      editor.dispatchKey({ sequence: "j" });
-      assert.strictEqual(editor.getEditField(), "conference");
+      assert.strictEqual(editor.getEditField(), "date");
 
       // k moves up to date
       editor.dispatchKey({ sequence: "k" });
@@ -1030,9 +1016,9 @@ async function runTests() {
       editor.dispatchKey({ sequence: "k" });
       assert.strictEqual(editor.getEditField(), "title");
 
-      // G jumps to conference
+      // G jumps to date
       editor.dispatchKey({ sequence: "G" });
-      assert.strictEqual(editor.getEditField(), "conference");
+      assert.strictEqual(editor.getEditField(), "date");
 
       // gg jumps to title
       editor.dispatchKey({ sequence: "g" });
@@ -1082,17 +1068,9 @@ async function runTests() {
       assert.strictEqual(editor.getMetadata().institute, "Tech Org");
       for (const ch of "2026-09-07") editor.dispatchKey({ sequence: ch });
 
-      // Enter moves to conference and enters INSERT mode
-      editor.dispatchKey({ name: "return" });
-      assert.strictEqual(editor.getMode(), "INSERT");
-      assert.strictEqual(editor.getEditField(), "conference");
-      assert.strictEqual(editor.getMetadata().date, "2026-09-07");
-      for (const ch of "Global Summit") editor.dispatchKey({ sequence: ch });
-
-      // Enter on final field (conference) confirms and returns to NORMAL mode
+      // Enter on final field (date) confirms and returns to NORMAL mode
       editor.dispatchKey({ name: "return" });
       assert.strictEqual(editor.getMode(), "NORMAL");
-      assert.strictEqual(editor.getMetadata().conference, "Global Summit");
       assert.strictEqual(editor.isModified(), true);
 
       // Verify Enter from EDIT_NORMAL mode also moves to following item in edit mode
@@ -1157,14 +1135,13 @@ async function runTests() {
       editor.dispatchKey({ sequence: "d" });
       assert.strictEqual(editor.getMetadata().title, "");
       assert.strictEqual(editor.getMetadata().author, "");
-      assert.strictEqual(editor.getMetadata().conference, "");
       assert.strictEqual(editor.getOutline().hasMetadata(), false);
 
       // 'u' restores it
       editor.dispatchKey({ sequence: "u" });
       assert.strictEqual(editor.getMetadata().title, "Deck Title");
       assert.strictEqual(editor.getMetadata().author, "Alice");
-      assert.strictEqual(editor.getMetadata().conference, "Conf 2026");
+      assert.deepStrictEqual(editor.getMetadata().extraLines, ["conference: Conf 2026"]);
       assert.strictEqual(editor.getOutline().hasMetadata(), true);
 
       (editor as any).quit(true);

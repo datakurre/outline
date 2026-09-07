@@ -35,7 +35,6 @@ export interface DeckMetadata {
   author: string;
   institute: string;
   date: string;
-  conference: string;
   extraLines: string[];
 }
 
@@ -47,7 +46,6 @@ export class Outline {
     author: "",
     institute: "",
     date: "",
-    conference: "",
     extraLines: [],
   };
   private nextId: number = 1;
@@ -70,7 +68,6 @@ export class Outline {
       this.metadata.author ||
       this.metadata.institute ||
       this.metadata.date ||
-      this.metadata.conference ||
       this.metadata.extraLines.length > 0
     );
   }
@@ -82,7 +79,6 @@ export class Outline {
       author: "",
       institute: "",
       date: "",
-      conference: "",
       extraLines: [],
     };
   }
@@ -94,7 +90,6 @@ export class Outline {
       author: src.author,
       institute: src.institute,
       date: src.date,
-      conference: src.conference,
       extraLines: [...src.extraLines],
     };
   }
@@ -106,7 +101,6 @@ export class Outline {
     if (this.metadata.author) lines.push(`author: ${this.escapeYamlValue(this.metadata.author)}`);
     if (this.metadata.institute) lines.push(`institute: ${this.escapeYamlValue(this.metadata.institute)}`);
     if (this.metadata.date) lines.push(`date: ${this.escapeYamlValue(this.metadata.date)}`);
-    if (this.metadata.conference) lines.push(`conference: ${this.escapeYamlValue(this.metadata.conference)}`);
     for (const extra of this.metadata.extraLines) {
       lines.push(extra);
     }
@@ -176,11 +170,6 @@ export class Outline {
           break;
         case "date":
           this.metadata.date = val;
-          break;
-        case "conference":
-        case "event":
-        case "venue":
-          this.metadata.conference = val;
           break;
         default:
           this.metadata.extraLines.push(raw);
@@ -1033,8 +1022,7 @@ type EditField =
   | "subtitle"
   | "author"
   | "institute"
-  | "date"
-  | "conference";
+  | "date";
 
 export function getFrontmatterFieldLabel(field: EditField): string {
   switch (field) {
@@ -1043,7 +1031,6 @@ export function getFrontmatterFieldLabel(field: EditField): string {
     case "author": return "Author";
     case "institute": return "Author Org";
     case "date": return "Date";
-    case "conference": return "Conference";
     default: return "Title";
   }
 }
@@ -1209,7 +1196,6 @@ export class OutlineEditorTUI {
       case "author": return "author";
       case "institute": return "author org";
       case "date": return "date";
-      case "conference": return "conference";
     }
   }
 
@@ -1564,7 +1550,7 @@ export class OutlineEditorTUI {
         // Level 2: Enter node text navigation before typing changes
         this.mode = "EDIT_NORMAL";
         this.statusMessage = this.onTitleSlide
-          ? `Navigating ${this.editFieldLabel} — h/l/j/k:Move  i/a:Insert  v:Visual  Tab:Field  ${this.editField === "conference" ? "Esc/Enter:Done" : "Esc:Done  Enter:Next"}`
+          ? `Navigating ${this.editFieldLabel} — h/l/j/k:Move  i/a:Insert  v:Visual  Tab:Field  Esc:Done  Enter:Next`
           : `Navigating ${this.editFieldLabel} — h/l/w/b:Move  i/a:Insert  Esc/Enter:Done`;
         this.statusIsError = false;
       }
@@ -1579,7 +1565,6 @@ export class OutlineEditorTUI {
         case "author": return this.outline.metadata.author;
         case "institute": return this.outline.metadata.institute;
         case "date": return this.outline.metadata.date;
-        case "conference": return this.outline.metadata.conference;
         default: return this.outline.metadata.title;
       }
     }
@@ -1602,7 +1587,6 @@ export class OutlineEditorTUI {
           case "author": this.outline.metadata.author = val; break;
           case "institute": this.outline.metadata.institute = val; break;
           case "date": this.outline.metadata.date = val; break;
-          case "conference": this.outline.metadata.conference = val; break;
         }
         return;
       }
@@ -1662,7 +1646,7 @@ export class OutlineEditorTUI {
     if (!current) return;
     this.commitField();
     const order: EditField[] = current.id === "title-slide"
-      ? ["title", "subtitle", "author", "institute", "date", "conference"]
+      ? ["title", "subtitle", "author", "institute", "date"]
       : ["title", "description", "notes"];
     const currentIdx = order.indexOf(this.editField);
     const nextField = targetField || order[(currentIdx + 1) % order.length];
@@ -1676,7 +1660,7 @@ export class OutlineEditorTUI {
     this.textUndoStack = [];
     this.textRedoStack = [];
     this.statusMessage = this.onTitleSlide
-      ? `Navigating ${this.editFieldLabel} — h/l/j/k:Move  i/a:Insert  v:Visual  Tab:Field  ${this.editField === "conference" ? "Esc/Enter:Done" : "Esc:Done  Enter:Next"}`
+      ? `Navigating ${this.editFieldLabel} — h/l/j/k:Move  i/a:Insert  v:Visual  Tab:Field  Esc:Done  Enter:Next`
       : (this.editingMultiline
           ? `Navigating ${this.editFieldLabel} — h/l/j/k:Move  i/a:Insert  v:Visual  Tab:Pane  Esc/Enter:Done`
           : `Navigating ${this.editFieldLabel} — h/l/w/b:Move  i/a:Insert  v:Visual  Tab:Pane  Esc/Enter:Done`);
@@ -1689,7 +1673,7 @@ export class OutlineEditorTUI {
     const current = this.selectedNode;
     if (!current) return;
     const order: EditField[] = current.id === "title-slide"
-      ? ["title", "subtitle", "author", "institute", "date", "conference"]
+      ? ["title", "subtitle", "author", "institute", "date"]
       : ["title", "description", "notes"];
     const currentIdx = order.indexOf(this.editField);
     this.switchPane(order[(currentIdx + order.length - 1) % order.length]);
@@ -1710,7 +1694,7 @@ export class OutlineEditorTUI {
 
   private navigateFrontmatterField(direction: 1 | -1, rightWidth?: number): void {
     const rw = rightWidth ?? this.getRightPaneWidth();
-    const fields: EditField[] = ["title", "subtitle", "author", "institute", "date", "conference"];
+    const fields: EditField[] = ["title", "subtitle", "author", "institute", "date"];
     const currentFieldIdx = fields.indexOf(this.editField);
     if (currentFieldIdx === -1) return;
 
@@ -1755,7 +1739,7 @@ export class OutlineEditorTUI {
         this.pendingVisualG = false;
         this.textUndoStack = [];
         this.textRedoStack = [];
-        this.statusMessage = `Navigating ${this.editFieldLabel} — h/l/j/k:Move  i/a:Insert  v:Visual  Tab:Field  ${this.editField === "conference" ? "Esc/Enter:Done" : "Esc:Done  Enter:Next"}`;
+        this.statusMessage = `Navigating ${this.editFieldLabel} — h/l/j/k:Move  i/a:Insert  v:Visual  Tab:Field  Esc:Done  Enter:Next`;
         this.statusIsError = false;
       }
     } else {
@@ -1785,7 +1769,7 @@ export class OutlineEditorTUI {
         this.pendingVisualG = false;
         this.textUndoStack = [];
         this.textRedoStack = [];
-        this.statusMessage = `Navigating ${this.editFieldLabel} — h/l/j/k:Move  i/a:Insert  v:Visual  Tab:Field  ${this.editField === "conference" ? "Esc/Enter:Done" : "Esc:Done  Enter:Next"}`;
+        this.statusMessage = `Navigating ${this.editFieldLabel} — h/l/j/k:Move  i/a:Insert  v:Visual  Tab:Field  Esc:Done  Enter:Next`;
         this.statusIsError = false;
       }
     }
@@ -1793,7 +1777,7 @@ export class OutlineEditorTUI {
 
   private nextFrontmatterField(enterInsertMode: boolean = true): boolean {
     if (!this.onTitleSlide) return false;
-    const fields: EditField[] = ["title", "subtitle", "author", "institute", "date", "conference"];
+    const fields: EditField[] = ["title", "subtitle", "author", "institute", "date"];
     const currentIdx = fields.indexOf(this.editField);
     if (currentIdx >= 0 && currentIdx < fields.length - 1) {
       this.commitField();
@@ -1808,8 +1792,8 @@ export class OutlineEditorTUI {
       this.textUndoStack = [];
       this.textRedoStack = [];
       this.statusMessage = enterInsertMode
-        ? `Editing ${this.editFieldLabel} — Type to edit  Esc:NavMode  Enter:${this.editField === "conference" ? "Confirm" : "Next"}`
-        : `Navigating ${this.editFieldLabel} — h/l/j/k:Move  i/a:Insert  v:Visual  Tab:Field  ${this.editField === "conference" ? "Esc/Enter:Done" : "Esc:Done  Enter:Next"}`;
+        ? `Editing ${this.editFieldLabel} — Type to edit  Esc:NavMode  Enter:Next`
+        : `Navigating ${this.editFieldLabel} — h/l/j/k:Move  i/a:Insert  v:Visual  Tab:Field  Esc:Done  Enter:Next`;
       this.statusIsError = false;
       return true;
     }
@@ -1830,7 +1814,6 @@ export class OutlineEditorTUI {
       { key: "author", label: "Author", value: meta.author },
       { key: "institute", label: "Author Org", value: meta.institute },
       { key: "date", label: "Date", value: meta.date },
-      { key: "conference", label: "Conference", value: meta.conference },
     ];
 
     const fieldLines: string[] = [];
@@ -2721,7 +2704,7 @@ export class OutlineEditorTUI {
         case "G":
           if (this.onTitleSlide) {
             this.commitField();
-            this.editField = "conference";
+            this.editField = "date";
             this.input = this.readField(this.titleSlideNode);
             this.inputCursor = Math.max(0, this.input.length - 1);
             this.visualAnchor = this.inputCursor;
@@ -3701,7 +3684,6 @@ export class OutlineEditorTUI {
       : this.editField === "author" ? "AUTHOR"
       : this.editField === "institute" ? "ORG"
       : this.editField === "date" ? "DATE"
-      : this.editField === "conference" ? "CONF"
       : "TITLE";
     if (this.mode === "EDIT_NORMAL") {
       modeBadge = this.onTitleSlide ? `\x1b[44;37m ${fieldTag}-NAV \x1b[0m` : (this.editingMultiline ? `\x1b[44;37m ${fieldTag}-NAV \x1b[0m` : "\x1b[44;37m EDIT-NAV \x1b[0m");
@@ -3969,10 +3951,10 @@ export class OutlineEditorTUI {
       const displayLine = this.editingMultiline ? `[Line ${info.line + 1}/${info.lines.length}] ` : "";
       const hint = nav
         ? (this.onTitleSlide
-            ? (this.editField === "conference" ? "[h/l/j/k:Move w/b:Word v:Visual Tab:Field Esc/Enter:Done]" : "[h/l/j/k:Move w/b:Word v:Visual Tab:Field Esc:Done Enter:EditNext]")
+            ? "[h/l/j/k:Move w/b:Word v:Visual Tab:Field Esc:Done Enter:EditNext]"
             : (this.editingMultiline ? "[h/l/j/k:Move w/b:Word v:Visual Tab:Pane Esc/Enter:Done]" : "[h/l:Move w/b:Word v:Visual Tab:Pane Esc/Enter:Done]"))
         : (this.onTitleSlide
-            ? (this.editField === "conference" ? "[Esc: Nav Mode | Enter: Confirm]" : "[Esc: Nav Mode | Enter: Next]")
+            ? "[Esc: Nav Mode | Enter: Next]"
             : "[Esc: Nav Mode | Enter: Confirm]");
       const color = nav ? "\x1b[1;34m" : "\x1b[1;33m";
       statusLine = ` ${color}${promptLabel}\x1b[0m${displayLine}\x1b[1m${echo.slice(0, cur)}\x1b[7m${cursorChar}\x1b[0m\x1b[1m${echo.slice(cur + 1)}\x1b[0m \x1b[2m${hint}\x1b[0m`;
@@ -3992,15 +3974,13 @@ export class OutlineEditorTUI {
       footerHints = " y:Yank  d/x:Cut  c:Change  p:Paste  o:SwapCursor  w/b/e:Word  0/$:LineEnd  Tab:Pane  Esc:Cancel";
     } else if (this.mode === "EDIT_NORMAL") {
       footerHints = this.onTitleSlide
-        ? (this.editField === "conference"
-            ? " h/l/j/k:Move  w/b/e:Word  v/V:Visual  yw/yy:Yank  p/P:Paste  Tab:Field  cw/de:Change  u:Undo  Esc/Enter:Done"
-            : " h/l/j/k:Move  w/b/e:Word  v/V:Visual  yw/yy:Yank  p/P:Paste  Tab:Field  Enter:EditNext  u:Undo  Esc:Done")
+        ? " h/l/j/k:Move  w/b/e:Word  v/V:Visual  yw/yy:Yank  p/P:Paste  Tab:Field  Enter:EditNext  u:Undo  Esc:Done"
         : (this.editingMultiline
             ? " h/l/j/k:Move  w/b/e:Word  v/V:Visual  yw/yy:Yank  p/P:Paste  Tab:Pane  cw/de:Change  u:Undo  Esc:Done"
             : " h/l:Move  w/b/e:Word  v/V:Visual  yw/yy:Yank  p/P:Paste  Tab:Pane  cw/de:Change  u:Undo  Esc:Done");
     } else if (this.mode === "INSERT") {
       const enterHint = this.onTitleSlide
-        ? (this.editField === "conference" ? "Confirm" : "Next")
+        ? "Next"
         : (this.editingMultiline ? "Newline" : "Confirm");
       footerHints = ` Type to edit  BS:Delete  Ctrl+W:DelWord  Ctrl+U:DelLine  Esc:NavMode  Enter:${enterHint}`;
     } else if (this.mode === "COMMAND") {
