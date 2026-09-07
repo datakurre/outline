@@ -36,30 +36,28 @@
               mkdir -p $out/bin $out/lib
               cp compiled/outline-editor.js $out/lib/outline-editor.js
 
-              cat > $out/bin/outline-editor <<EOF
+              cat > $out/bin/outline <<EOF
               #!${pkgs.runtimeShell}
               exec ${pkgs.nodejs}/bin/node $out/lib/outline-editor.js "\$@"
               EOF
-              chmod +x $out/bin/outline-editor
-              ln -s outline-editor $out/bin/outline
+              chmod +x $out/bin/outline
               runHook postInstall
             '';
 
             meta = {
               description = "Interactive direct-manipulation terminal outline editor for Markdown slides";
-              mainProgram = "outline-editor";
+              mainProgram = "outline";
             };
           };
         in
         {
           default = editor;
-          outline-editor = editor;
         });
 
       apps = forEachSystem (system: {
         default = {
           type = "app";
-          program = "${self.packages.${system}.default}/bin/outline-editor";
+          program = "${self.packages.${system}.default}/bin/outline";
         };
       });
     };
