@@ -816,11 +816,242 @@ async function runTests() {
       (editor as any).quit(true);
     });
 
+    // ----------------------------------------------------
+    // Frontmatter & Conference Metadata
+    // ----------------------------------------------------
+    await test("Frontmatter parses title, subtitle, author, institute, date, conference with aliases and extraLines", () => {
+      const markdown = [
+        "---",
+        "title: 'Scalable Systems'",
+        'subtitle: "Architecture and Design"',
+        "author: Jane Doe",
+        "organization: Acme Corp",
+        "event: TechConf 2026",
+        "date: 2026-09-07",
+        "theme: solarized",
+        "aspectratio: 169",
+        "---",
+        "",
+        "# First Slide",
+        "Slide content",
+      ].join("\n");
+
+      const outline = new Outline();
+      outline.fromMarkdown(markdown);
+      assert.strictEqual(outline.metadata.title, "Scalable Systems");
+      assert.strictEqual(outline.metadata.subtitle, "Architecture and Design");
+      assert.strictEqual(outline.metadata.author, "Jane Doe");
+      assert.strictEqual(outline.metadata.institute, "Acme Corp"); // parsed from organization
+      assert.strictEqual(outline.metadata.conference, "TechConf 2026"); // parsed from event
+      assert.strictEqual(outline.metadata.date, "2026-09-07");
+      assert.deepStrictEqual(outline.metadata.extraLines, ["theme: solarized", "aspectratio: 169"]);
+
+      const serialized = outline.toMarkdown();
+      assert.ok(serialized.includes("title: Scalable Systems"));
+      assert.ok(serialized.includes("subtitle: Architecture and Design"));
+      assert.ok(serialized.includes("author: Jane Doe"));
+      assert.ok(serialized.includes("institute: Acme Corp"));
+      assert.ok(serialized.includes("conference: TechConf 2026"));
+      assert.ok(serialized.includes("theme: solarized"));
+      assert.ok(serialized.includes("aspectratio: 169"));
+      assert.ok(serialized.includes("# First Slide"));
+    });
+
+    await test("Navigation: k from top slide selects Frontmatter, j returns to top slide", () => {
+      const editor = new OutlineEditorTUI(testFile);
+      assert.strictEqual(editor.isOnFrontmatter(), false);
+      assert.strictEqual(editor.isOnTitleSlide(), false);
+      assert.strictEqual(editor.getCurrentIndex(), 0);
+
+      // k from index 0 moves up to Frontmatter
+      editor.dispatchKey({ sequence: "k" });
+      assert.strictEqual(editor.isOnFrontmatter(), true);
+      assert.strictEqual(editor.isOnTitleSlide(), true);
+
+      // j moves back down to index 0
+      editor.dispatchKey({ sequence: "j" });
+      assert.strictEqual(editor.isOnFrontmatter(), false);
+      assert.strictEqual(editor.isOnTitleSlide(), false);
+      assert.strictEqual(editor.getCurrentIndex(), 0);
+
+      // gg jumps directly to Frontmatter
+      editor.dispatchKey({ sequence: "g" });
+      editor.dispatchKey({ sequence: "g" });
+      assert.strictEqual(editor.isOnFrontmatter(), true);
+      assert.strictEqual(editor.isOnTitleSlide(), true);
+
+      // G jumps to bottom slide
+      editor.dispatchKey({ sequence: "G" });
+      assert.strictEqual(editor.isOnFrontmatter(), false);
+      assert.strictEqual(editor.isOnTitleSlide(), false);
+      assert.strictEqual(editor.getCurrentIndex(), editor.getOutline().getVisibleNodes().length - 1);
+
+      (editor as any).quit(true);
+    });
+
+    await test("Initial load with frontmatter selects Frontmatter", () => {
+      const fmFile = path.resolve("./test-frontmatter.md");
+      fs.writeFileSync(fmFile, "---\ntitle: Deck Title\nauthor: Alice\n---\n\n# Slide 1\n");
+      const editor = new OutlineEditorTUI(fmFile);
+      assert.strictEqual(editor.isOnFrontmatter(), true);
+      assert.strictEqual(editor.isOnTitleSlide(), true);
+      assert.strictEqual(editor.getMetadata().title, "Deck Title");
+      assert.strictEqual(editor.getMetadata().author, "Alice");
+      (editor as any).quit(true);
+    });
+
+    await test("Editing frontmatter fields and cycling with Tab / Shift+Tab", () => {
+      const editor = new OutlineEditorTUI(testFile);
+      // Jump to Frontmatter
+      editor.dispatchKey({ sequence: "g" });
+      editor.dispatchKey({ sequence: "g" });
+      assert.strictEqual(editor.isOnFrontmatter(), true);
+
+      // Begin edit on title with 'e'
+      editor.dispatchKey({ sequence: "e" });
+      assert.strictEqual(editor.getMode(), "EDIT_NORMAL");
+      assert.strictEqual(editor.getEditField(), "title");
+
+      // Enter insert mode and type title
+      editor.dispatchKey({ sequence: "i" });
+      assert.strictEqual(editor.getMode(), "INSERT");
+      for (const ch of "Keynote Talk") editor.dispatchKey({ sequence: ch });
+      editor.dispatchKey({ name: "escape" });
+      assert.strictEqual(editor.getMode(), "EDIT_NORMAL");
+
+      // Press Tab to cycle to subtitle
+      editor.dispatchKey({ name: "tab" });
+      assert.strictEqual(editor.getEditField(), "subtitle");
+      editor.dispatchKey({ sequence: "i" });
+      for (const ch of "Future of Systems") editor.dispatchKey({ sequence: ch });
+      editor.dispatchKey({ name: "escape" });
+
+      // Press Tab to cycle to author
+      editor.dispatchKey({ name: "tab" });
+      assert.strictEqual(editor.getEditField(), "author");
+      editor.dispatchKey({ sequence: "i" });
+      for (const ch of "Bob Smith") editor.dispatchKey({ sequence: ch });
+      editor.dispatchKey({ name: "escape" });
+
+      // Press Tab to cycle to institute
+      editor.dispatchKey({ name: "tab" });
+      assert.strictEqual(editor.getEditField(), "institute");
+
+      // Press Tab to cycle to date
+      editor.dispatchKey({ name: "tab" });
+      assert.strictEqual(editor.getEditField(), "date");
+
+      // Press Tab to cycle to conference
+      editor.dispatchKey({ name: "tab" });
+      assert.strictEqual(editor.getEditField(), "conference");
+      editor.dispatchKey({ sequence: "i" });
+      for (const ch of "Conf 2026") editor.dispatchKey({ sequence: ch });
+      editor.dispatchKey({ name: "escape" });
+
+      // Press Tab to cycle back to title
+      editor.dispatchKey({ name: "tab" });
+      assert.strictEqual(editor.getEditField(), "title");
+      assert.strictEqual(editor.getInput(), "Keynote Talk");
+
+      // Press Shift+Tab to cycle backward to conference
+      editor.dispatchKey({ name: "tab", shift: true });
+      assert.strictEqual(editor.getEditField(), "conference");
+      assert.strictEqual(editor.getInput(), "Conf 2026");
+
+      // Press Enter to confirm and return to NORMAL
+      editor.dispatchKey({ name: "return" });
+      assert.strictEqual(editor.getMode(), "NORMAL");
+      assert.strictEqual(editor.getMetadata().title, "Keynote Talk");
+      assert.strictEqual(editor.getMetadata().subtitle, "Future of Systems");
+      assert.strictEqual(editor.getMetadata().author, "Bob Smith");
+      assert.strictEqual(editor.getMetadata().conference, "Conf 2026");
+      assert.strictEqual(editor.isModified(), true);
+
+      (editor as any).quit(true);
+    });
+
+    await test("Frontmatter: 'd' clears metadata and 'u' restores it via undo", () => {
+      const fmFile = path.resolve("./test-title-slide.md");
+      fs.writeFileSync(fmFile, "---\ntitle: Deck Title\nauthor: Alice\nconference: Conf 2026\n---\n\n# Slide 1\n");
+      const editor = new OutlineEditorTUI(fmFile);
+      assert.strictEqual(editor.isOnFrontmatter(), true);
+      assert.strictEqual(editor.getMetadata().title, "Deck Title");
+      assert.strictEqual(editor.getMetadata().author, "Alice");
+
+      // 'd' on Frontmatter clears metadata
+      editor.dispatchKey({ sequence: "d" });
+      assert.strictEqual(editor.getMetadata().title, "");
+      assert.strictEqual(editor.getMetadata().author, "");
+      assert.strictEqual(editor.getMetadata().conference, "");
+      assert.strictEqual(editor.getOutline().hasMetadata(), false);
+
+      // 'u' restores it
+      editor.dispatchKey({ sequence: "u" });
+      assert.strictEqual(editor.getMetadata().title, "Deck Title");
+      assert.strictEqual(editor.getMetadata().author, "Alice");
+      assert.strictEqual(editor.getMetadata().conference, "Conf 2026");
+      assert.strictEqual(editor.getOutline().hasMetadata(), true);
+
+      (editor as any).quit(true);
+    });
+
+    await test("Frontmatter: 'yy' yanks title, 'p' pastes new slide directly below Frontmatter", () => {
+      const fmFile = path.resolve("./test-title-slide.md");
+      fs.writeFileSync(fmFile, "---\ntitle: Presentation Title\n---\n\n# Slide 1\n\n# Slide 2\n");
+      const editor = new OutlineEditorTUI(fmFile);
+      assert.strictEqual(editor.isOnFrontmatter(), true);
+
+      // Yank title
+      editor.dispatchKey({ sequence: "y" });
+      editor.dispatchKey({ sequence: "y" });
+      const clip = editor.getClipboard();
+      assert.ok(clip);
+      assert.strictEqual(clip!.text, "Presentation Title");
+      assert.strictEqual(clip!.isLinewise, true);
+
+      // Paste below frontmatter: creates new slide at index 0
+      editor.dispatchKey({ sequence: "p" });
+      assert.strictEqual(editor.isOnFrontmatter(), false);
+      assert.strictEqual(editor.getCurrentIndex(), 0);
+      assert.strictEqual(editor.getOutline().getVisibleNodes()[0].title, "Presentation Title");
+      assert.strictEqual(editor.getOutline().getVisibleNodes()[1].title, "Slide 1");
+
+      (editor as any).quit(true);
+    });
+
+    await test("External reload preserves Frontmatter selection", async () => {
+      const reloadFile = path.resolve("./test-title-slide.md");
+      fs.writeFileSync(reloadFile, "---\ntitle: Deck Title\n---\n\n# Slide 1\n");
+      const editor = new OutlineEditorTUI(reloadFile);
+      assert.strictEqual(editor.isOnFrontmatter(), true);
+
+      // Trigger external modification
+      fs.writeFileSync(reloadFile, "---\ntitle: Deck Title Updated\nauthor: Bob\n---\n\n# Slide 1\n# Slide 2\n");
+      await sleep(150);
+
+      assert.strictEqual(editor.isOnFrontmatter(), true);
+      assert.strictEqual(editor.getMetadata().title, "Deck Title Updated");
+      assert.strictEqual(editor.getMetadata().author, "Bob");
+
+      (editor as any).quit(true);
+    });
+
+    await test("Frontmatter fallback title in UI is '(Frontmatter)'", () => {
+      const editor = new OutlineEditorTUI(testFile);
+      editor.dispatchKey({ sequence: "g" });
+      editor.dispatchKey({ sequence: "g" });
+      assert.strictEqual(editor.isOnFrontmatter(), true);
+      assert.strictEqual((editor as any).titleSlideNode.title, "Frontmatter");
+      (editor as any).quit(true);
+    });
+
   } finally {
     // A test that throws skips its own unlink, so sweep them all here rather
     // than leaving scratch files behind in the working directory.
     for (const name of [
       testFile,
+      "./test-title-slide.md",
+      "./test-frontmatter.md",
       "./test-anchor.md",
       "./test-undo-reload.md",
       "./test-deferred.md",

@@ -29,9 +29,27 @@ const FENCE_RE = /^\s*(`{3,}|~{3,})/;
 // the editor flags exactly what fromMarkdown will actually split on.
 const HEADING_RE = /^(#{1,6})[ \t]+(.+?)\s*#*\s*$/;
 
+export interface DeckMetadata {
+  title: string;
+  subtitle: string;
+  author: string;
+  institute: string;
+  date: string;
+  conference: string;
+  extraLines: string[];
+}
+
 export class Outline {
   root: OutlineNode;
-  frontmatter: string = "";
+  metadata: DeckMetadata = {
+    title: "",
+    subtitle: "",
+    author: "",
+    institute: "",
+    date: "",
+    conference: "",
+    extraLines: [],
+  };
   private nextId: number = 1;
 
   constructor() {
@@ -43,6 +61,135 @@ export class Outline {
       children: [],
       collapsed: false,
     };
+  }
+
+  hasMetadata(): boolean {
+    return Boolean(
+      this.metadata.title ||
+      this.metadata.subtitle ||
+      this.metadata.author ||
+      this.metadata.institute ||
+      this.metadata.date ||
+      this.metadata.conference ||
+      this.metadata.extraLines.length > 0
+    );
+  }
+
+  resetMetadata(): void {
+    this.metadata = {
+      title: "",
+      subtitle: "",
+      author: "",
+      institute: "",
+      date: "",
+      conference: "",
+      extraLines: [],
+    };
+  }
+
+  cloneMetadata(src: DeckMetadata = this.metadata): DeckMetadata {
+    return {
+      title: src.title,
+      subtitle: src.subtitle,
+      author: src.author,
+      institute: src.institute,
+      date: src.date,
+      conference: src.conference,
+      extraLines: [...src.extraLines],
+    };
+  }
+
+  getFrontmatter(): string {
+    const lines: string[] = [];
+    if (this.metadata.title) lines.push(`title: ${this.escapeYamlValue(this.metadata.title)}`);
+    if (this.metadata.subtitle) lines.push(`subtitle: ${this.escapeYamlValue(this.metadata.subtitle)}`);
+    if (this.metadata.author) lines.push(`author: ${this.escapeYamlValue(this.metadata.author)}`);
+    if (this.metadata.institute) lines.push(`institute: ${this.escapeYamlValue(this.metadata.institute)}`);
+    if (this.metadata.date) lines.push(`date: ${this.escapeYamlValue(this.metadata.date)}`);
+    if (this.metadata.conference) lines.push(`conference: ${this.escapeYamlValue(this.metadata.conference)}`);
+    for (const extra of this.metadata.extraLines) {
+      lines.push(extra);
+    }
+    if (lines.length === 0) return "";
+    return `---\n${lines.join("\n")}\n---`;
+  }
+
+  get frontmatter(): string {
+    return this.getFrontmatter();
+  }
+
+  set frontmatter(val: string) {
+    if (!val || !val.trim()) {
+      this.resetMetadata();
+      return;
+    }
+    const lines = val.replace(/\r\n?/g, "\n").split("\n");
+    this.parseFrontmatter(lines);
+  }
+
+  parseFrontmatter(lines: string[]): void {
+    this.resetMetadata();
+    for (const raw of lines) {
+      const trimmed = raw.trim();
+      if (!trimmed || trimmed === "---") continue;
+      const colonIdx = raw.indexOf(":");
+      if (colonIdx === -1) {
+        this.metadata.extraLines.push(raw);
+        continue;
+      }
+      const key = raw.slice(0, colonIdx).trim().toLowerCase();
+      let val = raw.slice(colonIdx + 1).trim();
+      if (
+        (val.startsWith('"') && val.endsWith('"') && val.length >= 2) ||
+        (val.startsWith("'") && val.endsWith("'") && val.length >= 2)
+      ) {
+        const inner = val.slice(1, -1);
+        try {
+          val = JSON.parse(val.startsWith('"') ? val : `"${inner.replace(/"/g, '\\"')}"`);
+        } catch {
+          val = inner;
+        }
+      }
+      switch (key) {
+        case "title":
+          this.metadata.title = val;
+          break;
+        case "subtitle":
+          this.metadata.subtitle = val;
+          break;
+        case "author":
+          this.metadata.author = val;
+          break;
+        case "institute":
+        case "institution":
+        case "organization":
+        case "affiliation":
+        case "org":
+        case "author-org":
+        case "author_org":
+          this.metadata.institute = val;
+          break;
+        case "date":
+          this.metadata.date = val;
+          break;
+        case "conference":
+        case "event":
+        case "venue":
+          this.metadata.conference = val;
+          break;
+        default:
+          this.metadata.extraLines.push(raw);
+          break;
+      }
+    }
+  }
+
+  private escapeYamlValue(val: string): string {
+    if (!val) return '""';
+    if (/^[:@`|>&*!%?#\-\[{,]/.test(val) || /[:#]|"|'|\n/.test(val) || val !== val.trim()) {
+      return JSON.stringify(val);
+    }
+    return val;
   }
 
   addChild(parentId: string, title: string): OutlineNode {
@@ -143,11 +290,16 @@ export class Outline {
   }
 
   cloneTree(): OutlineNode {
-    return this.cloneNode(this.root);
+    const cloned = this.cloneNode(this.root);
+    (cloned as any).metadata = this.cloneMetadata();
+    return cloned;
   }
 
   restoreTree(root: OutlineNode): void {
     this.root = this.cloneNode(root);
+    if ((root as any).metadata) {
+      this.metadata = this.cloneMetadata((root as any).metadata);
+    }
     this.updateNextId();
   }
 
@@ -222,8 +374,9 @@ export class Outline {
     }
 
     const body = slides.length > 0 ? `${slides.join("\n\n---\n\n")}\n` : "";
-    if (this.frontmatter) {
-      return `${this.frontmatter}\n\n${body}`;
+    const fm = this.getFrontmatter();
+    if (fm) {
+      return `${fm}\n\n${body}`;
     }
     return body;
   }
@@ -247,19 +400,19 @@ export class Outline {
 
     // Detect and preserve YAML frontmatter
     if (allLines.length > 0 && allLines[0].trim() === "---") {
-      const frontmatterLines: string[] = [allLines[0]];
+      const frontmatterLines: string[] = [];
       lineIdx = 1;
       while (lineIdx < allLines.length) {
-        frontmatterLines.push(allLines[lineIdx]);
         if (allLines[lineIdx].trim() === "---") {
           lineIdx++;
           break;
         }
+        frontmatterLines.push(allLines[lineIdx]);
         lineIdx++;
       }
-      this.frontmatter = frontmatterLines.join("\n");
+      this.parseFrontmatter(frontmatterLines);
     } else {
-      this.frontmatter = "";
+      this.resetMetadata();
     }
 
     // Blank lines are only meaningful once more description text follows them,
@@ -642,7 +795,15 @@ function getCursorLineInfo(text: string, index: number) {
   return { line, col, lineStart, lineEnd, lineText, lines };
 }
 
-type EditField = "title" | "description" | "notes";
+type EditField =
+  | "title"
+  | "description"
+  | "notes"
+  | "subtitle"
+  | "author"
+  | "institute"
+  | "date"
+  | "conference";
 
 // After a lone ESC, Node's readline waits `escapeCodeTimeout` ms (500 by
 // default) for the rest of a possible escape sequence before emitting the key.
@@ -663,6 +824,7 @@ export class OutlineEditorTUI {
   private outline: Outline = new Outline();
   private filename: string;
   private currentIndex: number = 0;
+  private onTitleSlide: boolean = false;
   private scrollOffset: number = 0;
   // Navigation levels and modes:
   // "NORMAL" (outline tree navigation)
@@ -732,6 +894,9 @@ export class OutlineEditorTUI {
       this.outline.addChild(mainContent.id, "Section 1");
       this.outline.addChild(mainContent.id, "Section 2");
     }
+    if (this.outline.hasMetadata()) {
+      this.onTitleSlide = true;
+    }
     this.markSaved();
     this.initFileWatcher();
   }
@@ -760,20 +925,55 @@ export class OutlineEditorTUI {
     });
   }
 
+  isOnTitleSlide(): boolean {
+    return this.onTitleSlide;
+  }
+
+  isOnFrontmatter(): boolean {
+    return this.onTitleSlide;
+  }
+
+  getMetadata(): DeckMetadata {
+    return this.outline.metadata;
+  }
+
+  private get titleSlideNode(): OutlineNode {
+    return {
+      id: "title-slide",
+      title: this.outline.metadata.title || "Frontmatter",
+      description: this.outline.metadata.subtitle,
+      notes: "",
+      children: [],
+      collapsed: false,
+    };
+  }
+
   private get visibleNodes(): OutlineNode[] {
     return this.outline.getVisibleNodes();
   }
 
-  /** Description and notes are multi-line; titles are a single line. */
+  /** Description and notes are multi-line; titles and frontmatter fields are a single line. */
   private get editingMultiline(): boolean {
-    return this.editField !== "title";
+    return this.editField === "description" || this.editField === "notes";
   }
 
   private get editFieldLabel(): string {
-    return this.editField === "notes" ? "notes" : this.editField === "description" ? "description" : "title";
+    switch (this.editField) {
+      case "notes": return "notes";
+      case "description": return "content";
+      case "title": return "title";
+      case "subtitle": return "subtitle";
+      case "author": return "author";
+      case "institute": return "author org";
+      case "date": return "date";
+      case "conference": return "conference";
+    }
   }
 
   private get selectedNode(): OutlineNode | null {
+    if (this.onTitleSlide) {
+      return this.titleSlideNode;
+    }
     const nodes = this.visibleNodes;
     return nodes[this.currentIndex] || null;
   }
@@ -828,15 +1028,36 @@ export class OutlineEditorTUI {
   }
 
   private moveSelection(delta: number): void {
-    this.currentIndex += delta;
-    this.clampSelection();
+    if (delta > 0) {
+      if (this.onTitleSlide) {
+        if (this.visibleNodes.length > 0) {
+          this.onTitleSlide = false;
+          this.currentIndex = Math.min(delta - 1, this.visibleNodes.length - 1);
+        }
+      } else {
+        this.currentIndex += delta;
+        this.clampSelection();
+      }
+    } else if (delta < 0) {
+      if (!this.onTitleSlide) {
+        if (this.currentIndex + delta < 0) {
+          this.onTitleSlide = true;
+          this.currentIndex = 0;
+        } else {
+          this.currentIndex += delta;
+          this.clampSelection();
+        }
+      }
+    }
   }
 
   private jumpTop(): void {
+    this.onTitleSlide = true;
     this.currentIndex = 0;
   }
 
   private jumpBottom(): void {
+    this.onTitleSlide = false;
     this.currentIndex = Math.max(0, this.visibleNodes.length - 1);
   }
 
@@ -1016,16 +1237,25 @@ export class OutlineEditorTUI {
   }
 
   private beginEdit(
-    kind: "siblingBelow" | "siblingAbove" | "child" | "title" | "description" | "notes"
+    kind: "siblingBelow" | "siblingAbove" | "child" | EditField
   ): void {
     const current = this.selectedNode;
     this.snapshot();
-    this.editField = kind === "description" || kind === "notes" ? kind : "title";
+    if (kind !== "child" && kind !== "siblingBelow" && kind !== "siblingAbove") {
+      this.editField = kind;
+    } else {
+      this.editField = "title";
+    }
     this.textUndoStack = [];
     this.textRedoStack = [];
     this.pendingEditOp = "";
 
     if (kind === "child") {
+      if (this.onTitleSlide) {
+        this.statusMessage = "Frontmatter cannot have child nodes";
+        this.mode = "NORMAL";
+        return;
+      }
       const targetId = current ? current.id : "root";
       const newNode = this.outline.addChild(targetId, "");
       if (current) current.collapsed = false;
@@ -1035,8 +1265,14 @@ export class OutlineEditorTUI {
       this.inputCursor = 0;
       this.mode = "INSERT";
     } else if (kind === "siblingBelow") {
-      if (!current) {
+      if (!current || this.onTitleSlide) {
         const newNode = this.outline.addChild("root", "");
+        const idx = this.outline.root.children.indexOf(newNode);
+        if (idx > 0) {
+          this.outline.root.children.splice(idx, 1);
+          this.outline.root.children.unshift(newNode);
+        }
+        this.onTitleSlide = false;
         this.currentIndex = 0;
         this.input = "";
         this.inputCursor = 0;
@@ -1049,6 +1285,11 @@ export class OutlineEditorTUI {
       }
       this.mode = "INSERT";
     } else if (kind === "siblingAbove") {
+      if (this.onTitleSlide) {
+        this.statusMessage = "Cannot insert slide above pinned frontmatter";
+        this.mode = "NORMAL";
+        return;
+      }
       if (!current) {
         const newNode = this.outline.addChild("root", "");
         this.currentIndex = 0;
@@ -1086,6 +1327,17 @@ export class OutlineEditorTUI {
   }
 
   private readField(node: OutlineNode): string {
+    if (node.id === "title-slide") {
+      switch (this.editField) {
+        case "title": return this.outline.metadata.title;
+        case "subtitle": return this.outline.metadata.subtitle;
+        case "author": return this.outline.metadata.author;
+        case "institute": return this.outline.metadata.institute;
+        case "date": return this.outline.metadata.date;
+        case "conference": return this.outline.metadata.conference;
+        default: return this.outline.metadata.title;
+      }
+    }
     if (this.editField === "description") return node.description;
     if (this.editField === "notes") return node.notes;
     return node.title;
@@ -1094,6 +1346,18 @@ export class OutlineEditorTUI {
   private commitField(): void {
     const node = this.selectedNode;
     if (node) {
+      if (node.id === "title-slide") {
+        const val = this.input.trim();
+        switch (this.editField) {
+          case "title": this.outline.metadata.title = val; node.title = val || "Frontmatter"; break;
+          case "subtitle": this.outline.metadata.subtitle = val; break;
+          case "author": this.outline.metadata.author = val; break;
+          case "institute": this.outline.metadata.institute = val; break;
+          case "date": this.outline.metadata.date = val; break;
+          case "conference": this.outline.metadata.conference = val; break;
+        }
+        return;
+      }
       if (this.editField === "description") {
         node.description = this.input;
       } else if (this.editField === "notes") {
@@ -1155,7 +1419,9 @@ export class OutlineEditorTUI {
     const current = this.selectedNode;
     if (!current) return;
     this.commitField();
-    const order: EditField[] = ["title", "description", "notes"];
+    const order: EditField[] = current.id === "title-slide"
+      ? ["title", "subtitle", "author", "institute", "date", "conference"]
+      : ["title", "description", "notes"];
     const currentIdx = order.indexOf(this.editField);
     const nextField = targetField || order[(currentIdx + 1) % order.length];
     this.editField = nextField;
@@ -1173,7 +1439,11 @@ export class OutlineEditorTUI {
   private switchPanePrev(): void {
     // No commitField here: switchPane does it, and doing it twice wrote the
     // same buffer back into the node on every Shift+Tab.
-    const order: EditField[] = ["title", "description", "notes"];
+    const current = this.selectedNode;
+    if (!current) return;
+    const order: EditField[] = current.id === "title-slide"
+      ? ["title", "subtitle", "author", "institute", "date", "conference"]
+      : ["title", "description", "notes"];
     const currentIdx = order.indexOf(this.editField);
     this.switchPane(order[(currentIdx + order.length - 1) % order.length]);
   }
@@ -1325,8 +1595,11 @@ export class OutlineEditorTUI {
   private yankCurrentNode(): void {
     const current = this.selectedNode;
     if (!current) return;
-    this.clipboard = { text: current.title, isLinewise: true };
-    this.statusMessage = `Yanked node title to clipboard: "${current.title}"`;
+    const title = current.id === "title-slide"
+      ? (this.outline.metadata.title || "Frontmatter")
+      : current.title;
+    this.clipboard = { text: title, isLinewise: true };
+    this.statusMessage = `Yanked node title to clipboard: "${title}"`;
     this.statusIsError = false;
   }
 
@@ -1343,8 +1616,15 @@ export class OutlineEditorTUI {
     const description = rawLines.slice(1).join("\n").trim();
 
     let newNode: OutlineNode;
-    if (!current || current.id === "root") {
+    if (!current || current.id === "root" || current.id === "title-slide") {
       newNode = this.outline.addChild("root", title);
+      const childIdx = this.outline.root.children.indexOf(newNode);
+      if (childIdx > 0) {
+        this.outline.root.children.splice(childIdx, 1);
+        this.outline.root.children.unshift(newNode);
+      }
+      this.onTitleSlide = false;
+      this.currentIndex = 0;
     } else if (before) {
       newNode = this.outline.addSiblingBefore(current.id, title);
     } else {
@@ -1373,16 +1653,9 @@ export class OutlineEditorTUI {
   isModified(): boolean { return this.modified; }
   isDiskFileModified(): boolean { return this.diskFileModified; }
   getStatusMessage(): string { return this.statusMessage; }
-  getOutline(): Outline { return this.outline; }
   getCurrentIndex(): number { return this.currentIndex; }
-  /**
-   * Feed a keypress in without a terminal.
-   *
-   * `sequence` defaults only for single-character names: defaulting it for a
-   * named key would invent input no terminal sends (readline delivers Tab as
-   * `"\t"`, never `"tab"`) and let a test pass against a dispatcher that a
-   * real keyboard cannot reach.
-   */
+  getOutline(): Outline { return this.outline; }
+
   dispatchKey(key: Partial<readline.Key>): void {
     const name = key.name || "";
     const fullKey: readline.Key = {
@@ -1396,6 +1669,13 @@ export class OutlineEditorTUI {
   }
 
   private deleteCurrentNode(): void {
+    if (this.onTitleSlide) {
+      this.snapshot();
+      this.outline.resetMetadata();
+      this.statusMessage = "Cleared frontmatter (press 'u' to undo)";
+      this.statusIsError = false;
+      return;
+    }
     const node = this.selectedNode;
     if (!node) return;
     this.snapshot();
@@ -2231,31 +2511,42 @@ export class OutlineEditorTUI {
           break;
         case "left":
         case "h":
+          if (this.onTitleSlide) break;
           this.toggleFold(false);
           break;
         case "right":
         case "l":
+          if (this.onTitleSlide) break;
           this.toggleFold(true);
           break;
         case "space":
+          if (this.onTitleSlide) break;
           this.toggleFold();
           break;
         case "J":
+          if (this.onTitleSlide) break;
           this.moveSibling(1);
           break;
         case "K":
+          if (this.onTitleSlide) break;
           this.moveSibling(-1);
           break;
         case "tab":
+          if (this.onTitleSlide) {
+            this.beginEdit("title");
+            break;
+          }
           if (key.shift) this.dedentNode();
           else this.indentNode();
           break;
         case ">":
         case "L":
+          if (this.onTitleSlide) break;
           this.indentNode();
           break;
         case "<":
         case "H":
+          if (this.onTitleSlide) break;
           this.dedentNode();
           break;
         case "o":
@@ -2278,17 +2569,25 @@ export class OutlineEditorTUI {
           this.mode = "INSERT";
           break;
         case "E":
-          this.beginEdit("description");
+          if (this.onTitleSlide) {
+            this.beginEdit("subtitle");
+          } else {
+            this.beginEdit("description");
+          }
           break;
         case "N":
-          this.beginEdit("notes");
+          if (this.onTitleSlide) {
+            this.statusMessage = "Speaker notes not applicable to frontmatter";
+          } else {
+            this.beginEdit("notes");
+          }
           break;
         // beginEdit bails out when there is no node, so entering VISUAL is
         // conditional on it having actually opened a buffer — otherwise the
         // badge would read VISUAL over the previous node's stale text.
         case "v":
         case "V":
-          if (this.selectedNode) {
+          if (this.selectedNode && (!this.onTitleSlide || this.readField(this.selectedNode).length > 0)) {
             this.beginEdit("title");
             this.mode = "VISUAL";
             this.visualType = normalKeyToken(key) === "V" ? "line" : "char";
@@ -2303,7 +2602,7 @@ export class OutlineEditorTUI {
           this.pasteNode(false);
           break;
         case "P":
-          this.pasteNode(true);
+          this.pasteNode(this.onTitleSlide ? false : true);
           break;
         case "d":
         case "x":
@@ -2462,7 +2761,10 @@ export class OutlineEditorTUI {
    * node. The heading path is stable under that edit, so it is tried first,
    * with the slot kept only as a fallback for a genuine rename.
    */
-  private selectionAnchor(): { titlePath: string[]; index: number } | null {
+  private selectionAnchor(): { titlePath: string[]; index: number; onTitleSlide?: boolean } | null {
+    if (this.onTitleSlide) {
+      return { titlePath: ["__TITLE_SLIDE__"], index: 0, onTitleSlide: true };
+    }
     const node = this.selectedNode;
     if (!node) return null;
     const titlePath: string[] = [];
@@ -2471,14 +2773,19 @@ export class OutlineEditorTUI {
       titlePath.unshift(cur.title);
       cur = this.outline.findParent(this.outline.root, cur.id);
     }
-    return { titlePath, index: this.currentIndex };
+    return { titlePath, index: this.currentIndex, onTitleSlide: false };
   }
 
-  private restoreSelection(anchor: { titlePath: string[]; index: number } | null): void {
+  private restoreSelection(anchor: { titlePath: string[]; index: number; onTitleSlide?: boolean } | null): void {
     if (!anchor) {
       this.clampSelection();
       return;
     }
+    if (anchor.onTitleSlide) {
+      this.onTitleSlide = true;
+      return;
+    }
+    this.onTitleSlide = false;
     const visible = this.visibleNodes;
     const pathOf = (node: OutlineNode): string[] => {
       const out: string[] = [];
@@ -2700,6 +3007,40 @@ export class OutlineEditorTUI {
     }
   }
 
+  private formatInlineEdit(input: string, cursor: number): string {
+    if (this.mode === "VISUAL") {
+      const sel = this.getSelectionRange();
+      let formatted = "";
+      let inSel = false;
+      for (let i = 0; i < input.length; i++) {
+        const ch = input[i];
+        const isCursor = i === cursor;
+        const isSelectedChar = i >= sel.start && i <= sel.end;
+        if (isCursor) {
+          if (inSel) { formatted += "\x1b[0m"; inSel = false; }
+          formatted += `\x1b[7;1m${ch}\x1b[0m`;
+        } else if (isSelectedChar) {
+          if (!inSel) { formatted += "\x1b[48;5;24;37m"; inSel = true; }
+          formatted += ch;
+        } else {
+          if (inSel) { formatted += "\x1b[0m"; inSel = false; }
+          formatted += ch;
+        }
+      }
+      if (inSel) { formatted += "\x1b[0m"; inSel = false; }
+      if (cursor >= input.length) {
+        formatted += `\x1b[7;1m \x1b[0m`;
+      }
+      return formatted;
+    } else {
+      const cur = Math.max(0, Math.min(cursor, input.length));
+      const before = input.slice(0, cur);
+      const cursorChar = cur < input.length ? input[cur] : " ";
+      const after = cur < input.length ? input.slice(cur + 1) : "";
+      return `${before}\x1b[7m${cursorChar}\x1b[0m${after}`;
+    }
+  }
+
   private render(): void {
     if (this.closed) return;
     // While a `:!cmd` is suspended, the terminal is showing raw command
@@ -2714,7 +3055,14 @@ export class OutlineEditorTUI {
     const modTag = (this.modified ? " \x1b[33m[+Modified]\x1b[0m" : "") +
                    (this.diskFileModified ? " \x1b[31m[Disk Modified]\x1b[0m" : "");
     let modeBadge = "\x1b[42;30m OUTLINE \x1b[0m";
-    const fieldTag = this.editField === "notes" ? "NOTE" : this.editField === "description" ? "CONTENT" : "TITLE";
+    const fieldTag = this.editField === "notes" ? "NOTE"
+      : this.editField === "description" ? "CONTENT"
+      : this.editField === "subtitle" ? "SUBTITLE"
+      : this.editField === "author" ? "AUTHOR"
+      : this.editField === "institute" ? "ORG"
+      : this.editField === "date" ? "DATE"
+      : this.editField === "conference" ? "CONF"
+      : "TITLE";
     if (this.mode === "EDIT_NORMAL") {
       modeBadge = this.editingMultiline ? `\x1b[44;37m ${fieldTag}-NAV \x1b[0m` : "\x1b[44;37m EDIT-NAV \x1b[0m";
     } else if (this.mode === "VISUAL") {
@@ -2753,12 +3101,14 @@ export class OutlineEditorTUI {
     }
 
     const visible = this.visibleNodes;
-    if (this.currentIndex < this.scrollOffset) {
-      this.scrollOffset = this.currentIndex;
-    } else if (this.currentIndex >= this.scrollOffset + paneHeight) {
-      this.scrollOffset = this.currentIndex - paneHeight + 1;
+    const totalTreeRows = 1 + visible.length;
+    const activeRow = this.onTitleSlide ? 0 : 1 + this.currentIndex;
+    if (activeRow < this.scrollOffset) {
+      this.scrollOffset = activeRow;
+    } else if (activeRow >= this.scrollOffset + paneHeight) {
+      this.scrollOffset = activeRow - paneHeight + 1;
     }
-    this.scrollOffset = Math.max(0, Math.min(this.scrollOffset, Math.max(0, visible.length - paneHeight)));
+    this.scrollOffset = Math.max(0, Math.min(this.scrollOffset, Math.max(0, totalTreeRows - paneHeight)));
 
     const selected = this.selectedNode;
 
@@ -2778,7 +3128,52 @@ export class OutlineEditorTUI {
     };
 
     const rightLines: string[] = [];
-    if (selected) {
+    if (this.onTitleSlide) {
+      const meta = this.outline.metadata;
+      rightLines.push(truncateToWidth("\x1b[1mType:\x1b[0m Frontmatter \x1b[2m(YAML)\x1b[0m", rightWidth, true));
+      const divider = `\x1b[2m${"─".repeat(rightWidth)}\x1b[0m`;
+      rightLines.push(divider);
+
+      const isEditing = this.mode === "EDIT_NORMAL" || this.mode === "INSERT" || this.mode === "VISUAL";
+      const fields: Array<{ key: EditField; label: string; value: string }> = [
+        { key: "title", label: "Title", value: meta.title },
+        { key: "subtitle", label: "Subtitle", value: meta.subtitle },
+        { key: "author", label: "Author", value: meta.author },
+        { key: "institute", label: "Author Org", value: meta.institute },
+        { key: "date", label: "Date", value: meta.date },
+        { key: "conference", label: "Conference", value: meta.conference },
+      ];
+
+      for (const field of fields) {
+        const active = isEditing && this.editField === field.key;
+        const prefix = active ? "\x1b[1;36m▶ \x1b[0m" : "  ";
+        const labelStr = active ? `\x1b[1;36m${field.label}:\x1b[0m ` : `\x1b[1m${field.label}:\x1b[0m `;
+        let valStr = "";
+        if (active) {
+          valStr = this.formatInlineEdit(this.input, this.inputCursor);
+        } else if (field.value) {
+          valStr = field.value;
+        } else {
+          valStr = "\x1b[2m(empty)\x1b[0m";
+        }
+        rightLines.push(truncateToWidth(`${prefix}${labelStr}${valStr}`, rightWidth, true));
+      }
+
+      if (meta.extraLines && meta.extraLines.length > 0) {
+        rightLines.push(truncateToWidth(`  \x1b[2m+ ${meta.extraLines.length} custom YAML lines preserved\x1b[0m`, rightWidth, true));
+      }
+
+      if (paneHeight > rightLines.length + 4) {
+        rightLines.push(divider);
+        rightLines.push("\x1b[1mPreview (YAML):\x1b[0m");
+        const fm = this.outline.getFrontmatter();
+        const fmLines = fm.split("\n");
+        const remainingSpace = paneHeight - rightLines.length;
+        for (let i = 0; i < Math.min(fmLines.length, remainingSpace); i++) {
+          rightLines.push(truncateToWidth(`\x1b[2m${fmLines[i]}\x1b[0m`, rightWidth, false));
+        }
+      }
+    } else if (selected) {
       const metaLines: string[] = [];
       if (focused) {
         metaLines.push(truncateToWidth(`\x1b[1mTitle:\x1b[0m ${selected.title || "(empty)"}`, rightWidth, true));
@@ -2879,12 +3274,38 @@ export class OutlineEditorTUI {
 
     // Middle rows
     for (let r = 0; r < paneHeight; r++) {
-      const nodeIndex = this.scrollOffset + r;
+      const rowIdx = this.scrollOffset + r;
       let leftCell = "";
 
-      if (nodeIndex < visible.length) {
+      if (rowIdx === 0) {
+        const isSelected = this.onTitleSlide;
+        const selMark = isSelected ? "\x1b[1;36m❯\x1b[0m " : "  ";
+        const icon = "\x1b[35m◆\x1b[0m ";
+        const prefix = `${selMark}${icon}`;
+        const prefixW = stringWidth(prefix);
+        const availTitleW = Math.max(1, leftWidth - prefixW);
+
+        let titleStr = this.outline.metadata.title || "(Frontmatter)";
+        if (isSelected && (this.mode === "EDIT_NORMAL" || this.mode === "INSERT" || this.mode === "VISUAL") && this.editField === "title") {
+          titleStr = this.formatInlineEdit(this.input, this.inputCursor);
+        } else if (!this.outline.metadata.title) {
+          titleStr = "\x1b[2m(Frontmatter)\x1b[0m";
+        }
+
+        const truncatedTitle = truncateToWidth(titleStr, availTitleW, true);
+        const lineContent = `${prefix}${truncatedTitle}`;
+        const padCount = Math.max(0, leftWidth - stringWidth(lineContent));
+        const fullLine = lineContent + " ".repeat(padCount);
+
+        if (isSelected) {
+          leftCell = `\x1b[48;5;236m${fullLine}\x1b[0m`;
+        } else {
+          leftCell = fullLine;
+        }
+      } else if (rowIdx - 1 < visible.length) {
+        const nodeIndex = rowIdx - 1;
         const node = visible[nodeIndex];
-        const isSelected = nodeIndex === this.currentIndex;
+        const isSelected = !this.onTitleSlide && nodeIndex === this.currentIndex;
         const depth = this.outline.getNodeDepth(node.id);
         const indent = "  ".repeat(Math.max(0, depth - 1));
         const foldIcon = node.children.length > 0 ? (node.collapsed ? "\x1b[33m▶\x1b[0m" : "\x1b[33m▼\x1b[0m") : "\x1b[2m•\x1b[0m";
@@ -2897,37 +3318,7 @@ export class OutlineEditorTUI {
 
         let titleStr = node.title || "(empty)";
         if (isSelected && (this.mode === "EDIT_NORMAL" || this.mode === "INSERT" || this.mode === "VISUAL") && !this.editingMultiline) {
-          if (this.mode === "VISUAL") {
-            const sel = this.getSelectionRange();
-            let formatted = "";
-            let inSel = false;
-            for (let i = 0; i < this.input.length; i++) {
-              const ch = this.input[i];
-              const isCursor = i === this.inputCursor;
-              const isSelectedChar = i >= sel.start && i <= sel.end;
-              if (isCursor) {
-                if (inSel) { formatted += "\x1b[0m"; inSel = false; }
-                formatted += `\x1b[7;1m${ch}\x1b[0m`;
-              } else if (isSelectedChar) {
-                if (!inSel) { formatted += "\x1b[48;5;24;37m"; inSel = true; }
-                formatted += ch;
-              } else {
-                if (inSel) { formatted += "\x1b[0m"; inSel = false; }
-                formatted += ch;
-              }
-            }
-            if (inSel) { formatted += "\x1b[0m"; inSel = false; }
-            if (this.inputCursor >= this.input.length) {
-              formatted += `\x1b[7;1m \x1b[0m`;
-            }
-            titleStr = formatted;
-          } else {
-            const cur = Math.max(0, Math.min(this.inputCursor, this.input.length));
-            const before = this.input.slice(0, cur);
-            const cursorChar = cur < this.input.length ? this.input[cur] : " ";
-            const after = cur < this.input.length ? this.input.slice(cur + 1) : "";
-            titleStr = `${before}\x1b[7m${cursorChar}\x1b[0m${after}`;
-          }
+          titleStr = this.formatInlineEdit(this.input, this.inputCursor);
         }
 
         const truncatedTitle = truncateToWidth(titleStr, availTitleW, true);
@@ -2959,7 +3350,7 @@ export class OutlineEditorTUI {
     // Status / Prompt line
     let statusLine = "";
     if (this.mode === "VISUAL") {
-      const fieldName = this.editField === "notes" ? "NOTES" : this.editField === "description" ? "CONTENT" : "TITLE";
+      const fieldName = this.editFieldLabel.toUpperCase();
       const sel = this.getSelectionRange();
       const countDesc = sel.isLinewise
         ? `${sel.text.split("\n").filter((_, idx, arr) => idx < arr.length - 1 || arr[idx].length > 0).length} lines`
@@ -2967,7 +3358,7 @@ export class OutlineEditorTUI {
       const typeDesc = this.visualType === "line" ? "LINE" : "CHAR";
       statusLine = ` \x1b[1;35mVISUAL (${typeDesc}) ${fieldName}:\x1b[0m \x1b[1m[${countDesc} selected]\x1b[0m \x1b[2m[y:Yank d:Cut p:Paste o:SwapEnd Tab:Pane Esc:Cancel]\x1b[0m`;
     } else if (this.mode === "EDIT_NORMAL" || this.mode === "INSERT") {
-      const fieldName = this.editField === "notes" ? "NOTES" : this.editField === "description" ? "CONTENT" : "TITLE";
+      const fieldName = this.editFieldLabel.toUpperCase();
       const nav = this.mode === "EDIT_NORMAL";
       const promptLabel = `EDIT ${fieldName} (${nav ? "NAV" : "INSERT"}): `;
       // Multi-line fields echo just the line under the cursor; the full text
@@ -3002,6 +3393,8 @@ export class OutlineEditorTUI {
       footerHints = ` Type to edit  BS:Delete  Ctrl+W:DelWord  Ctrl+U:DelLine  Esc:NavMode  Enter:${this.editingMultiline ? "Newline" : "Confirm"}`;
     } else if (this.mode === "COMMAND") {
       footerHints = " Enter:Execute  Esc:Cancel  ↑/↓:History  ← →:Move";
+    } else if (this.onTitleSlide) {
+      footerHints = " j:Slides  e/i:EditTitle  E:Subtitle  Tab:Fields  yy:Yank  d:Reset  u:Undo  ?:Help";
     } else {
       footerHints = " j/k:Move  h/l:Fold  o/c:New  e/E/N:Edit  v/y/p:Clip  d:Del  u:Undo  ?:Help  Tab:Indent  J/K:Reorder";
     }
@@ -3023,7 +3416,8 @@ export class OutlineEditorTUI {
       "║                   OUTLINE EDITOR  —  HELP & KEYMAP                   ║",
       "╠══════════════════════════════════════════════════════════════════════╣",
       "║  NORMAL MODE  (outline navigation)                                   ║",
-      "║    j / k          Move selection  │  gg / G       Top / bottom       ║",
+      "║    j / k          Move (k at top selects pinned Frontmatter)         ║",
+      "║    gg / G         Jump to Frontmatter / bottom slide                 ║",
       "║    Ctrl+F/B       Page ↓ / ↑      │  Ctrl+D/U     Half-page ↓ / ↑    ║",
       "║    h / l / Space  Collapse / expand / toggle fold                    ║",
       "║    w / b          Next / previous sibling                            ║",
@@ -3031,7 +3425,7 @@ export class OutlineEditorTUI {
       "║    J / K          Reorder: move node down / up within siblings       ║",
       "║    Tab / >        Indent (demote)   Shift+Tab / <  Dedent (promote)  ║",
       "║    e / R / Enter  Edit title        i  Edit title → INSERT           ║",
-      "║    E / N          Edit content / speaker notes                       ║",
+      "║    E / N          Edit content / notes (E: subtitle in frontmatter)  ║",
       "║    v / V          Visual text selection on title                     ║",
       "║    yy / Y         Yank node title to clipboard                       ║",
       "║    p / P          Paste clipboard as new sibling below / above       ║",
@@ -3045,7 +3439,7 @@ export class OutlineEditorTUI {
       "║    v / V          Start characterwise / linewise visual selection    ║",
       "║    yw / ye / yy   Yank word / line to app-internal clipboard         ║",
       "║    p / P          Paste clipboard after / before cursor              ║",
-      "║    Tab / S-Tab    Cycle pane (Title ↔ Content ↔ Notes)               ║",
+      "║    Tab / S-Tab    Cycle pane / frontmatter field                     ║",
       "║    Ctrl+W w       Cycle pane;  Ctrl+W h/l/j/k direct pane jump       ║",
       "║    j / k          Move by logical line (content / notes); a          ║",
       "║                   wrapped line is stepped over whole, as in vim      ║",

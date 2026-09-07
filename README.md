@@ -336,7 +336,27 @@ Speaker notes round-trip cleanly as pandoc fenced divs (`::: notes` ... `:::`), 
 
 ### YAML Frontmatter
 
-YAML metadata blocks delimited by `---` at the beginning of the file are preserved verbatim when loading and saving.
+`outline-editor` provides first-class support for YAML frontmatter tailored for conference slides and slide decks (compatible with Pandoc Beamer, reveal.js, Marp, Slidev, etc.):
+
+- **Pinned Frontmatter Item**: A dedicated `◆ Frontmatter` item is pinned at the top of the outline tree (displaying the deck title once set, or `(Frontmatter)` when empty).
+  - Press `k` from the top slide (or `gg` from anywhere) to navigate to the Frontmatter item.
+  - Press `j` to move back down into the slide tree.
+- **Conference Metadata Fields**:
+  - `title`: Presentation title.
+  - `subtitle`: Subtitle or talk description.
+  - `author`: Presenter name(s).
+  - `institute`: Author affiliation or organization (also parses aliases `organization`, `affiliation`, `org`).
+  - `date`: Presentation date.
+  - `conference`: Event or venue (also parses aliases `event`, `venue`).
+- **Live Editing & Field Cycling**:
+  - Press `e`, `i`, or `Enter` on Frontmatter to edit the presentation title.
+  - Press `E` on Frontmatter to edit the subtitle.
+  - While editing any frontmatter field, press `Tab` or `Shift+Tab` to cycle smoothly through all fields:
+    `Title ↔ Subtitle ↔ Author ↔ Author Org ↔ Date ↔ Conference`.
+  - The right pane provides a live YAML frontmatter preview showing exact serialization.
+- **Data Preservation & Undo**:
+  - Unknown or custom frontmatter keys (such as `theme`, `aspectratio`, or `header-includes`) are preserved verbatim without data loss.
+  - Press `d` on Frontmatter to clear frontmatter fields, and `u` to restore them with structural undo (`Ctrl+R` for redo).
 
 ### Raw Markdown in Content & Notes
 
