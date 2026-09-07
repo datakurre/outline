@@ -99,7 +99,7 @@ export class Outline {
     };
   }
 
-  getFrontmatter(): string {
+  getFrontmatterBody(): string {
     const lines: string[] = [];
     if (this.metadata.title) lines.push(`title: ${this.escapeYamlValue(this.metadata.title)}`);
     if (this.metadata.subtitle) lines.push(`subtitle: ${this.escapeYamlValue(this.metadata.subtitle)}`);
@@ -110,8 +110,13 @@ export class Outline {
     for (const extra of this.metadata.extraLines) {
       lines.push(extra);
     }
-    if (lines.length === 0) return "";
-    return `---\n${lines.join("\n")}\n---`;
+    return lines.join("\n");
+  }
+
+  getFrontmatter(): string {
+    const body = this.getFrontmatterBody();
+    if (!body) return "";
+    return `---\n${body}\n---`;
   }
 
   get frontmatter(): string {
@@ -670,7 +675,56 @@ export const MD_ITALIC = "\x1b[3m";
  * the div early — so `trackStructure` is false there and fence markers are
  * rendered as ordinary text.
  */
-export function computeMarkdownStyles(lines: string[], trackStructure: boolean): string[][] {
+export function computeMarkdownStyles(lines: string[], trackStructure: boolean | "yaml"): string[][] {
+  if (trackStructure === "yaml") {
+    return lines.map((line) => {
+      const styles = new Array<string>(line.length).fill("");
+      const mark = (start: number, end: number, style: string) => {
+        for (let c = Math.max(0, start); c < end && c < styles.length; c++) styles[c] = style;
+      };
+      const trimmed = line.trimStart();
+      if (trimmed.startsWith("#") || trimmed === "---" || trimmed === "...") {
+        mark(0, line.length, trimmed.startsWith("#") ? MD_DIM : MD_STRUCTURE);
+        return styles;
+      }
+      const colonIdx = line.indexOf(":");
+      if (colonIdx !== -1) {
+        mark(0, colonIdx, MD_CODE);
+        mark(colonIdx, colonIdx + 1, MD_DIM);
+        const valStr = line.slice(colonIdx + 1);
+        const quoteMatch = valStr.match(/^(\s*)(["'])/);
+        if (quoteMatch) {
+          const qChar = quoteMatch[2];
+          const qStart = colonIdx + 1 + quoteMatch[1].length;
+          const rest = line.slice(qStart + 1);
+          let closed = false;
+          let closeIdx = -1;
+          if (qChar === '"') {
+            let esc = false;
+            for (let j = 0; j < rest.length; j++) {
+              if (esc) esc = false;
+              else if (rest[j] === "\\") esc = true;
+              else if (rest[j] === '"') { closed = true; closeIdx = j; break; }
+            }
+          } else {
+            for (let j = 0; j < rest.length; j++) {
+              if (rest[j] === "'" && rest[j + 1] === "'") j++;
+              else if (rest[j] === "'") { closed = true; closeIdx = j; break; }
+            }
+          }
+          if (closed) {
+            mark(qStart, qStart + 1 + closeIdx + 1, MD_ITALIC);
+          } else {
+            mark(qStart, line.length, MD_CAUTION);
+          }
+        }
+      } else if (trimmed.length > 0 && !trimmed.startsWith("-")) {
+        mark(0, line.length, MD_CAUTION);
+      }
+      return styles;
+    });
+  }
+
   const kind: Array<"fence-delim" | "fence-content" | "normal"> = [];
   if (trackStructure) {
     let inFence = false;
@@ -795,6 +849,183 @@ function getCursorLineInfo(text: string, index: number) {
   return { line, col, lineStart, lineEnd, lineText, lines };
 }
 
+function checkLineQuotesAndBrackets(str: string, lineNum: number): { valid: boolean; error?: string } {
+  if (!str) return { valid: true };
+
+  // Double quotes
+  if (str.startsWith('"')) {
+    let escaped = false;
+    let closed = false;
+    let closeIdx = -1;
+    for (let i = 1; i < str.length; i++) {
+      const ch = str[i];
+      if (escaped) {
+        escaped = false;
+      } else if (ch === "\\") {
+        escaped = true;
+      } else if (ch === '"') {
+        closed = true;
+        closeIdx = i;
+        break;
+      }
+    }
+    if (!closed) {
+      return { valid: false, error: `YAML syntax error (line ${lineNum}): unterminated double quote` };
+    }
+    const remainder = str.slice(closeIdx + 1).trim();
+    if (remainder.length > 0 && !remainder.startsWith("#")) {
+      return { valid: false, error: `YAML syntax error (line ${lineNum}): unexpected characters after closing quote` };
+    }
+    const quoteContent = str.slice(0, closeIdx + 1);
+    try {
+      JSON.parse(quoteContent);
+    } catch {
+      return { valid: false, error: `YAML syntax error (line ${lineNum}): invalid escape sequence in double quotes` };
+    }
+    return { valid: true };
+  }
+
+  // Single quotes
+  if (str.startsWith("'")) {
+    let closed = false;
+    let closeIdx = -1;
+    for (let i = 1; i < str.length; i++) {
+      if (str[i] === "'") {
+        if (i + 1 < str.length && str[i + 1] === "'") {
+          i++;
+        } else {
+          closed = true;
+          closeIdx = i;
+          break;
+        }
+      }
+    }
+    if (!closed) {
+      return { valid: false, error: `YAML syntax error (line ${lineNum}): unterminated single quote` };
+    }
+    const remainder = str.slice(closeIdx + 1).trim();
+    if (remainder.length > 0 && !remainder.startsWith("#")) {
+      return { valid: false, error: `YAML syntax error (line ${lineNum}): unexpected characters after closing quote` };
+    }
+    return { valid: true };
+  }
+
+  // Bracket and brace matching for unquoted / flow values
+  const stack: string[] = [];
+  let inDouble = false;
+  let inSingle = false;
+  let escaped = false;
+  for (let i = 0; i < str.length; i++) {
+    const ch = str[i];
+    if (inDouble) {
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === '"') inDouble = false;
+    } else if (inSingle) {
+      if (ch === "'" && i + 1 < str.length && str[i + 1] === "'") {
+        i++;
+      } else if (ch === "'") {
+        inSingle = false;
+      }
+    } else {
+      if (ch === "#" && (i === 0 || str[i - 1] === " " || str[i - 1] === "\t")) {
+        break;
+      }
+      if (ch === '"') inDouble = true;
+      else if (ch === "'") inSingle = true;
+      else if (ch === "[" || ch === "{") stack.push(ch);
+      else if (ch === "]") {
+        const last = stack.pop();
+        if (last !== "[") return { valid: false, error: `YAML syntax error (line ${lineNum}): unmatched closing ']'` };
+      } else if (ch === "}") {
+        const last = stack.pop();
+        if (last !== "{") return { valid: false, error: `YAML syntax error (line ${lineNum}): unmatched closing '}'` };
+      }
+    }
+  }
+  if (inDouble) return { valid: false, error: `YAML syntax error (line ${lineNum}): unterminated double quote` };
+  if (inSingle) return { valid: false, error: `YAML syntax error (line ${lineNum}): unterminated single quote` };
+  if (stack.length > 0) {
+    const unclosed = stack.pop();
+    return { valid: false, error: `YAML syntax error (line ${lineNum}): unclosed '${unclosed}'` };
+  }
+  return { valid: true };
+}
+
+export function validateFrontmatterYaml(yamlText: string): { valid: boolean; error?: string } {
+  const lines = yamlText.replace(/\r\n?/g, "\n").split("\n");
+  let inBlockScalar = false;
+  let blockScalarIndent = 0;
+
+  for (let i = 0; i < lines.length; i++) {
+    const rawLine = lines[i];
+    const lineNum = i + 1;
+    const leadingMatch = rawLine.match(/^[ \t]*/);
+    const leadingWs = leadingMatch ? leadingMatch[0] : "";
+    if (leadingWs.includes("\t")) {
+      return { valid: false, error: `YAML syntax error (line ${lineNum}): tabs are not allowed for indentation` };
+    }
+
+    const trimmed = rawLine.trim();
+    if (!trimmed || trimmed === "---" || trimmed === "..." || trimmed.startsWith("#")) continue;
+
+    const indent = leadingWs.length;
+    if (inBlockScalar) {
+      if (indent > blockScalarIndent) continue;
+      inBlockScalar = false;
+    }
+
+    const lineContent = rawLine.trimStart();
+    if (lineContent.startsWith("-")) {
+      const afterDash = lineContent.slice(1);
+      if (afterDash.length > 0 && afterDash[0] !== " " && afterDash[0] !== "\t") {
+        return { valid: false, error: `YAML syntax error (line ${lineNum}): list marker '-' must be followed by space` };
+      }
+      const rest = afterDash.trimStart();
+      const quoteCheck = checkLineQuotesAndBrackets(rest, lineNum);
+      if (!quoteCheck.valid) return quoteCheck;
+      continue;
+    }
+
+    const colonIdx = lineContent.indexOf(":");
+    if (colonIdx === -1) {
+      return { valid: false, error: `YAML syntax error (line ${lineNum}): missing ':' in mapping ("${truncateToWidth(trimmed, 30, false)}")` };
+    }
+    if (colonIdx === 0) {
+      return { valid: false, error: `YAML syntax error (line ${lineNum}): empty mapping key` };
+    }
+
+    const key = lineContent.slice(0, colonIdx);
+    const afterColon = lineContent.slice(colonIdx + 1);
+    if (afterColon.length > 0 && afterColon[0] !== " " && afterColon[0] !== "\t") {
+      return { valid: false, error: `YAML syntax error (line ${lineNum}): colon after key '${key.trim()}' must be followed by space` };
+    }
+
+    const valueStr = afterColon.trim();
+    if (valueStr === "|" || valueStr === ">" || valueStr.startsWith("|-") || valueStr.startsWith(">-") || valueStr.startsWith("|+") || valueStr.startsWith(">+")) {
+      inBlockScalar = true;
+      blockScalarIndent = indent;
+      continue;
+    }
+
+    const valCheck = checkLineQuotesAndBrackets(valueStr, lineNum);
+    if (!valCheck.valid) return valCheck;
+
+    if (valueStr.length > 0 && !valueStr.startsWith('"') && !valueStr.startsWith("'") && !valueStr.startsWith("[") && !valueStr.startsWith("{")) {
+      let valWithoutComment = valueStr;
+      const commentIdx = valWithoutComment.search(/(^|\s)#/);
+      if (commentIdx !== -1) {
+        valWithoutComment = valWithoutComment.slice(0, commentIdx).trimEnd();
+      }
+      if (valWithoutComment.includes(": ")) {
+        return { valid: false, error: `YAML syntax error (line ${lineNum}): unquoted value containing ': ' must be wrapped in quotes` };
+      }
+    }
+  }
+
+  return { valid: true };
+}
+
 type EditField =
   | "title"
   | "description"
@@ -804,6 +1035,18 @@ type EditField =
   | "institute"
   | "date"
   | "conference";
+
+export function getFrontmatterFieldLabel(field: EditField): string {
+  switch (field) {
+    case "title": return "Title";
+    case "subtitle": return "Subtitle";
+    case "author": return "Author";
+    case "institute": return "Author Org";
+    case "date": return "Date";
+    case "conference": return "Conference";
+    default: return "Title";
+  }
+}
 
 // After a lone ESC, Node's readline waits `escapeCodeTimeout` ms (500 by
 // default) for the rest of a possible escape sequence before emitting the key.
@@ -952,7 +1195,7 @@ export class OutlineEditorTUI {
     return this.outline.getVisibleNodes();
   }
 
-  /** Description and notes are multi-line; titles and frontmatter fields are a single line. */
+  /** Description and notes are multi-line; titles and discrete fields are a single line. */
   private get editingMultiline(): boolean {
     return this.editField === "description" || this.editField === "notes";
   }
@@ -1320,7 +1563,9 @@ export class OutlineEditorTUI {
         this.inputCursor = this.editingMultiline ? 0 : Math.max(0, this.input.length - 1);
         // Level 2: Enter node text navigation before typing changes
         this.mode = "EDIT_NORMAL";
-        this.statusMessage = `Navigating ${this.editFieldLabel} — h/l/w/b:Move  i/a:Insert  Esc/Enter:Done`;
+        this.statusMessage = this.onTitleSlide
+          ? `Navigating ${this.editFieldLabel} — h/l/j/k:Move  i/a:Insert  v:Visual  Tab:Field  ${this.editField === "conference" ? "Esc/Enter:Done" : "Esc:Done  Enter:Next"}`
+          : `Navigating ${this.editFieldLabel} — h/l/w/b:Move  i/a:Insert  Esc/Enter:Done`;
         this.statusIsError = false;
       }
     }
@@ -1349,7 +1594,10 @@ export class OutlineEditorTUI {
       if (node.id === "title-slide") {
         const val = this.input.trim();
         switch (this.editField) {
-          case "title": this.outline.metadata.title = val; node.title = val || "Frontmatter"; break;
+          case "title":
+            this.outline.metadata.title = val;
+            node.title = val || "Frontmatter";
+            break;
           case "subtitle": this.outline.metadata.subtitle = val; break;
           case "author": this.outline.metadata.author = val; break;
           case "institute": this.outline.metadata.institute = val; break;
@@ -1368,7 +1616,7 @@ export class OutlineEditorTUI {
     }
   }
 
-  private finishEdit(): void {
+  private finishEdit(): boolean {
     this.commitField();
     this.mode = "NORMAL";
     this.input = "";
@@ -1382,6 +1630,7 @@ export class OutlineEditorTUI {
     this.statusMessage = "Ready";
     this.statusIsError = false;
     this.applyPendingReload();
+    return true;
   }
 
   private cancelEdit(): void {
@@ -1391,15 +1640,8 @@ export class OutlineEditorTUI {
       // Pop the snapshot that beginEdit pushed so undo history stays clean.
       const prev = this.undoStack.pop();
       if (prev) {
-        try {
-          this.outline.restoreTree(prev);
-          this.redoStack = [];
-        } catch {
-          // If restore fails, fall back to plain delete.
-          this.outline.deleteNode(node.id);
-        }
-      } else {
-        this.outline.deleteNode(node.id);
+        this.outline.root = prev.root;
+        this.outline.metadata = this.outline.cloneMetadata(prev.metadata);
       }
       this.clampSelection();
     }
@@ -1430,9 +1672,14 @@ export class OutlineEditorTUI {
     this.mode = "EDIT_NORMAL";
     this.pendingEditOp = "";
     this.pendingCtrlW = false;
+    this.pendingVisualG = false;
     this.textUndoStack = [];
     this.textRedoStack = [];
-    this.statusMessage = `Navigating ${this.editFieldLabel} — h/l/w/b:Move  i/a:Insert  v:Visual  Tab:Pane  Esc/Enter:Done`;
+    this.statusMessage = this.onTitleSlide
+      ? `Navigating ${this.editFieldLabel} — h/l/j/k:Move  i/a:Insert  v:Visual  Tab:Field  ${this.editField === "conference" ? "Esc/Enter:Done" : "Esc:Done  Enter:Next"}`
+      : (this.editingMultiline
+          ? `Navigating ${this.editFieldLabel} — h/l/j/k:Move  i/a:Insert  v:Visual  Tab:Pane  Esc/Enter:Done`
+          : `Navigating ${this.editFieldLabel} — h/l/w/b:Move  i/a:Insert  v:Visual  Tab:Pane  Esc/Enter:Done`);
     this.statusIsError = false;
   }
 
@@ -1446,6 +1693,276 @@ export class OutlineEditorTUI {
       : ["title", "description", "notes"];
     const currentIdx = order.indexOf(this.editField);
     this.switchPane(order[(currentIdx + order.length - 1) % order.length]);
+  }
+
+  private getRightPaneWidth(): number {
+    const cols = process.stdout.columns || 80;
+    const sepWidth = 3;
+    const usable = Math.max(2, cols - sepWidth);
+    let leftWidth = Math.max(24, Math.min(Math.floor(usable * 0.52), usable - 26));
+    let rightWidth = Math.max(20, usable - leftWidth);
+    if (leftWidth + rightWidth > usable) {
+      leftWidth = Math.max(1, Math.floor(usable * 0.52));
+      rightWidth = Math.max(1, usable - leftWidth);
+    }
+    return rightWidth;
+  }
+
+  private navigateFrontmatterField(direction: 1 | -1, rightWidth?: number): void {
+    const rw = rightWidth ?? this.getRightPaneWidth();
+    const fields: EditField[] = ["title", "subtitle", "author", "institute", "date", "conference"];
+    const currentFieldIdx = fields.indexOf(this.editField);
+    if (currentFieldIdx === -1) return;
+
+    const label = getFrontmatterFieldLabel(this.editField);
+    const firstWidth = Math.max(1, rw - (4 + label.length));
+    const contWidth = Math.max(1, rw - 4);
+    const segments = this.input.length > 0
+      ? wrapLineSegments(this.input, firstWidth, contWidth)
+      : [{ text: "", start: 0 }];
+
+    let curSegIdx = 0;
+    for (let s = 0; s < segments.length; s++) {
+      if (segments[s].start <= this.inputCursor) {
+        curSegIdx = s;
+      }
+    }
+    const curCol = this.inputCursor - segments[curSegIdx].start;
+
+    if (direction === 1) {
+      if (curSegIdx < segments.length - 1) {
+        const nextSeg = segments[curSegIdx + 1];
+        const targetCol = nextSeg.text.length > 0
+          ? Math.min(curCol, Math.max(0, nextSeg.text.length - 1))
+          : 0;
+        this.inputCursor = nextSeg.start + targetCol;
+      } else if (currentFieldIdx < fields.length - 1) {
+        this.commitField();
+        this.editField = fields[currentFieldIdx + 1];
+        this.input = this.readField(this.titleSlideNode);
+        const nextLabel = getFrontmatterFieldLabel(this.editField);
+        const nextFirstW = Math.max(1, rw - (4 + nextLabel.length));
+        const nextContW = Math.max(1, rw - 4);
+        const nextSegs = this.input.length > 0
+          ? wrapLineSegments(this.input, nextFirstW, nextContW)
+          : [{ text: "", start: 0 }];
+        const targetCol = nextSegs[0].text.length > 0
+          ? Math.min(curCol, Math.max(0, nextSegs[0].text.length - 1))
+          : 0;
+        this.inputCursor = nextSegs[0].start + targetCol;
+        this.pendingEditOp = "";
+        this.pendingCtrlW = false;
+        this.pendingVisualG = false;
+        this.textUndoStack = [];
+        this.textRedoStack = [];
+        this.statusMessage = `Navigating ${this.editFieldLabel} — h/l/j/k:Move  i/a:Insert  v:Visual  Tab:Field  ${this.editField === "conference" ? "Esc/Enter:Done" : "Esc:Done  Enter:Next"}`;
+        this.statusIsError = false;
+      }
+    } else {
+      if (curSegIdx > 0) {
+        const prevSeg = segments[curSegIdx - 1];
+        const targetCol = prevSeg.text.length > 0
+          ? Math.min(curCol, Math.max(0, prevSeg.text.length - 1))
+          : 0;
+        this.inputCursor = prevSeg.start + targetCol;
+      } else if (currentFieldIdx > 0) {
+        this.commitField();
+        this.editField = fields[currentFieldIdx - 1];
+        this.input = this.readField(this.titleSlideNode);
+        const prevLabel = getFrontmatterFieldLabel(this.editField);
+        const prevFirstW = Math.max(1, rw - (4 + prevLabel.length));
+        const prevContW = Math.max(1, rw - 4);
+        const prevSegs = this.input.length > 0
+          ? wrapLineSegments(this.input, prevFirstW, prevContW)
+          : [{ text: "", start: 0 }];
+        const lastSeg = prevSegs[prevSegs.length - 1];
+        const targetCol = lastSeg.text.length > 0
+          ? Math.min(curCol, Math.max(0, lastSeg.text.length - 1))
+          : 0;
+        this.inputCursor = lastSeg.start + targetCol;
+        this.pendingEditOp = "";
+        this.pendingCtrlW = false;
+        this.pendingVisualG = false;
+        this.textUndoStack = [];
+        this.textRedoStack = [];
+        this.statusMessage = `Navigating ${this.editFieldLabel} — h/l/j/k:Move  i/a:Insert  v:Visual  Tab:Field  ${this.editField === "conference" ? "Esc/Enter:Done" : "Esc:Done  Enter:Next"}`;
+        this.statusIsError = false;
+      }
+    }
+  }
+
+  private nextFrontmatterField(enterInsertMode: boolean = true): boolean {
+    if (!this.onTitleSlide) return false;
+    const fields: EditField[] = ["title", "subtitle", "author", "institute", "date", "conference"];
+    const currentIdx = fields.indexOf(this.editField);
+    if (currentIdx >= 0 && currentIdx < fields.length - 1) {
+      this.commitField();
+      this.editField = fields[currentIdx + 1];
+      this.input = this.readField(this.titleSlideNode);
+      this.inputCursor = this.input.length;
+      this.mode = enterInsertMode ? "INSERT" : "EDIT_NORMAL";
+      this.visualAnchor = this.inputCursor;
+      this.pendingEditOp = "";
+      this.pendingCtrlW = false;
+      this.pendingVisualG = false;
+      this.textUndoStack = [];
+      this.textRedoStack = [];
+      this.statusMessage = enterInsertMode
+        ? `Editing ${this.editFieldLabel} — Type to edit  Esc:NavMode  Enter:${this.editField === "conference" ? "Confirm" : "Next"}`
+        : `Navigating ${this.editFieldLabel} — h/l/j/k:Move  i/a:Insert  v:Visual  Tab:Field  ${this.editField === "conference" ? "Esc/Enter:Done" : "Esc:Done  Enter:Next"}`;
+      this.statusIsError = false;
+      return true;
+    }
+    return false;
+  }
+
+  renderFrontmatterFields(rightWidth: number, paneHeight: number): string[] {
+    const meta = this.outline.metadata;
+    const headerLines: string[] = [];
+    headerLines.push(truncateToWidth("\x1b[1mType:\x1b[0m Frontmatter \x1b[2m(YAML)\x1b[0m", rightWidth, true));
+    const divider = `\x1b[2m${"─".repeat(rightWidth)}\x1b[0m`;
+    headerLines.push(divider);
+
+    const isEditing = this.mode === "EDIT_NORMAL" || this.mode === "INSERT" || this.mode === "VISUAL";
+    const fields: Array<{ key: EditField; label: string; value: string }> = [
+      { key: "title", label: "Title", value: meta.title },
+      { key: "subtitle", label: "Subtitle", value: meta.subtitle },
+      { key: "author", label: "Author", value: meta.author },
+      { key: "institute", label: "Author Org", value: meta.institute },
+      { key: "date", label: "Date", value: meta.date },
+      { key: "conference", label: "Conference", value: meta.conference },
+    ];
+
+    const fieldLines: string[] = [];
+    let cursorLineIdx = -1;
+
+    for (const field of fields) {
+      const active = isEditing && this.editField === field.key;
+      const prefix = active ? "\x1b[1;36m▶ \x1b[0m" : "  ";
+      const labelStr = active ? `\x1b[1;36m${field.label}:\x1b[0m ` : `\x1b[1m${field.label}:\x1b[0m `;
+      const firstPrefixW = 2 + field.label.length + 2;
+      const firstWidth = Math.max(1, rightWidth - firstPrefixW);
+      const contIndent = "    ";
+      const contWidth = Math.max(1, rightWidth - contIndent.length);
+
+      if (active) {
+        if (this.input.length === 0) {
+          cursorLineIdx = fieldLines.length;
+          const cursorBlock = this.mode === "VISUAL" ? "\x1b[7;1m \x1b[0m" : "\x1b[7m \x1b[0m";
+          fieldLines.push(truncateToWidth(`${prefix}${labelStr}${cursorBlock}`, rightWidth, true));
+        } else {
+          const segments = wrapLineSegments(this.input, firstWidth, contWidth);
+          if (this.mode === "VISUAL") {
+            const sel = this.getSelectionRange();
+            for (let s = 0; s < segments.length; s++) {
+              const seg = segments[s];
+              let rowFormatted = "";
+              let inSel = false;
+              let segHasCursor = false;
+              for (let col = 0; col < seg.text.length; col++) {
+                const absIdx = seg.start + col;
+                const isSelected = absIdx >= sel.start && absIdx <= sel.end;
+                const isCursor = absIdx === this.inputCursor;
+                const ch = seg.text[col];
+                if (isCursor) {
+                  segHasCursor = true;
+                  if (inSel) { rowFormatted += "\x1b[0m"; inSel = false; }
+                  rowFormatted += `\x1b[7;1m${ch}\x1b[0m`;
+                } else if (isSelected) {
+                  if (!inSel) { rowFormatted += "\x1b[48;5;24;37m"; inSel = true; }
+                  rowFormatted += ch;
+                } else {
+                  if (inSel) { rowFormatted += "\x1b[0m"; inSel = false; }
+                  rowFormatted += ch;
+                }
+              }
+              if (inSel) { rowFormatted += "\x1b[0m"; inSel = false; }
+              if (s === segments.length - 1 && this.inputCursor >= this.input.length) {
+                segHasCursor = true;
+                rowFormatted += `\x1b[7;1m \x1b[0m`;
+              }
+              if (segHasCursor) {
+                cursorLineIdx = fieldLines.length;
+              }
+              const rowText = s === 0 ? `${prefix}${labelStr}${rowFormatted}` : `${contIndent}${rowFormatted}`;
+              fieldLines.push(truncateToWidth(rowText, rightWidth, true));
+            }
+          } else {
+            let activeSegIdx = 0;
+            for (let s = 0; s < segments.length; s++) {
+              if (segments[s].start <= this.inputCursor) {
+                activeSegIdx = s;
+              }
+            }
+            for (let s = 0; s < segments.length; s++) {
+              const seg = segments[s];
+              if (s === activeSegIdx) {
+                cursorLineIdx = fieldLines.length;
+                const curCol = Math.min(this.inputCursor - seg.start, seg.text.length);
+                const before = seg.text.slice(0, curCol);
+                const ch = curCol < seg.text.length ? seg.text[curCol] : " ";
+                const after = curCol < seg.text.length ? seg.text.slice(curCol + 1) : "";
+                const formatted = `${before}\x1b[7m${ch}\x1b[0m${after}`;
+                const rowText = s === 0 ? `${prefix}${labelStr}${formatted}` : `${contIndent}${formatted}`;
+                fieldLines.push(truncateToWidth(rowText, rightWidth, true));
+              } else {
+                const rowText = s === 0 ? `${prefix}${labelStr}${seg.text}` : `${contIndent}${seg.text}`;
+                fieldLines.push(truncateToWidth(rowText, rightWidth, true));
+              }
+            }
+          }
+        }
+      } else {
+        if (!field.value) {
+          fieldLines.push(truncateToWidth(`${prefix}${labelStr}\x1b[2m(empty)\x1b[0m`, rightWidth, true));
+        } else {
+          const lines = field.value.split("\n");
+          for (let li = 0; li < lines.length; li++) {
+            const segs = wrapLineSegments(lines[li], li === 0 ? firstWidth : contWidth, contWidth);
+            for (let s = 0; s < segs.length; s++) {
+              const rowText = (li === 0 && s === 0)
+                ? `${prefix}${labelStr}${segs[s].text}`
+                : `${contIndent}${segs[s].text}`;
+              fieldLines.push(truncateToWidth(rowText, rightWidth, true));
+            }
+          }
+        }
+      }
+    }
+
+    if (meta.extraLines && meta.extraLines.length > 0) {
+      fieldLines.push(truncateToWidth(`  \x1b[2m+ ${meta.extraLines.length} custom YAML lines preserved\x1b[0m`, rightWidth, true));
+    }
+
+    const availableForFields = Math.max(1, paneHeight - headerLines.length);
+    let visibleFieldLines: string[];
+    let extraPreviewSpace = 0;
+
+    if (fieldLines.length <= availableForFields) {
+      visibleFieldLines = fieldLines;
+      extraPreviewSpace = availableForFields - fieldLines.length;
+    } else {
+      let first = 0;
+      if (cursorLineIdx >= 0) {
+        first = Math.max(0, Math.min(cursorLineIdx - Math.floor(availableForFields / 2), fieldLines.length - availableForFields));
+      }
+      visibleFieldLines = fieldLines.slice(first, first + availableForFields);
+    }
+
+    const result: string[] = [...headerLines, ...visibleFieldLines];
+
+    if (extraPreviewSpace >= 4) {
+      result.push(divider);
+      result.push("\x1b[1mPreview (YAML):\x1b[0m");
+      const fm = this.outline.getFrontmatter();
+      const fmLines = fm.split("\n");
+      const remainingSpace = paneHeight - result.length;
+      for (let i = 0; i < Math.min(fmLines.length, remainingSpace); i++) {
+        result.push(truncateToWidth(`\x1b[2m${fmLines[i]}\x1b[0m`, rightWidth, false));
+      }
+    }
+
+    return result;
   }
 
   private getSelectionRange(): { start: number; end: number; text: string; isLinewise: boolean } {
@@ -1769,8 +2286,9 @@ export class OutlineEditorTUI {
       }
 
       if (key.ctrl && key.name === "s") {
-        this.finishEdit();
-        this.saveFile();
+        if (this.finishEdit()) {
+          this.saveFile();
+        }
         this.render();
         return;
       }
@@ -1868,6 +2386,28 @@ export class OutlineEditorTUI {
           break;
         case "j":
         case "down":
+          if (this.onTitleSlide) {
+            const rw = this.getRightPaneWidth();
+            const label = getFrontmatterFieldLabel(this.editField);
+            const firstWidth = Math.max(1, rw - (4 + label.length));
+            const contWidth = Math.max(1, rw - 4);
+            const segments = this.input.length > 0
+              ? wrapLineSegments(this.input, firstWidth, contWidth)
+              : [{ text: "", start: 0 }];
+            let curSegIdx = 0;
+            for (let s = 0; s < segments.length; s++) {
+              if (segments[s].start <= this.inputCursor) curSegIdx = s;
+            }
+            if (curSegIdx < segments.length - 1) {
+              const curCol = this.inputCursor - segments[curSegIdx].start;
+              const nextSeg = segments[curSegIdx + 1];
+              const targetCol = nextSeg.text.length > 0
+                ? Math.min(curCol, Math.max(0, nextSeg.text.length - 1))
+                : 0;
+              this.inputCursor = nextSeg.start + targetCol;
+            }
+            break;
+          }
           if (this.editingMultiline && info.line < info.lines.length - 1) {
             const nextLineStart = info.lineEnd + 1;
             const nextLineText = info.lines[info.line + 1];
@@ -1877,6 +2417,28 @@ export class OutlineEditorTUI {
           break;
         case "k":
         case "up":
+          if (this.onTitleSlide) {
+            const rw = this.getRightPaneWidth();
+            const label = getFrontmatterFieldLabel(this.editField);
+            const firstWidth = Math.max(1, rw - (4 + label.length));
+            const contWidth = Math.max(1, rw - 4);
+            const segments = this.input.length > 0
+              ? wrapLineSegments(this.input, firstWidth, contWidth)
+              : [{ text: "", start: 0 }];
+            let curSegIdx = 0;
+            for (let s = 0; s < segments.length; s++) {
+              if (segments[s].start <= this.inputCursor) curSegIdx = s;
+            }
+            if (curSegIdx > 0) {
+              const curCol = this.inputCursor - segments[curSegIdx].start;
+              const prevSeg = segments[curSegIdx - 1];
+              const targetCol = prevSeg.text.length > 0
+                ? Math.min(curCol, Math.max(0, prevSeg.text.length - 1))
+                : 0;
+              this.inputCursor = prevSeg.start + targetCol;
+            }
+            break;
+          }
           if (this.editingMultiline && info.line > 0) {
             const prevLineText = info.lines[info.line - 1];
             const prevLineStart = this.input.slice(0, info.lineStart - 1).lastIndexOf("\n") + 1;
@@ -1923,11 +2485,13 @@ export class OutlineEditorTUI {
         } else if (token === "h" || key.name === "left") {
           this.switchPane("title");
         } else if (token === "l" || key.name === "right") {
-          this.switchPane("description");
+          this.switchPane(this.onTitleSlide ? "subtitle" : "description");
         } else if (token === "j" || key.name === "down") {
-          this.switchPane("notes");
+          if (this.onTitleSlide) this.switchPane();
+          else this.switchPane("notes");
         } else if (token === "k" || key.name === "up") {
-          this.switchPane("description");
+          if (this.onTitleSlide) this.switchPanePrev();
+          else this.switchPane("description");
         }
         this.render();
         return;
@@ -2045,8 +2609,9 @@ export class OutlineEditorTUI {
         return;
       }
       if (key.ctrl && key.name === "s") {
-        this.finishEdit();
-        this.saveFile();
+        if (this.finishEdit()) {
+          this.saveFile();
+        }
         this.render();
         return;
       }
@@ -2055,9 +2620,54 @@ export class OutlineEditorTUI {
         this.render();
         return;
       }
-      if (key.name === "escape" || key.name === "return") {
+      if (key.name === "escape") {
         // Return to Level 1 outline navigation
-        this.finishEdit();
+        if (!this.finishEdit()) {
+          this.render();
+          return;
+        }
+        this.render();
+        return;
+      }
+      if (key.name === "return") {
+        if (this.onTitleSlide) {
+          if (!this.nextFrontmatterField(true)) {
+            this.finishEdit();
+          }
+        } else {
+          if (!this.finishEdit()) {
+            this.render();
+            return;
+          }
+        }
+        this.render();
+        return;
+      }
+
+      if (this.pendingVisualG) {
+        this.pendingVisualG = false;
+        if (seq === "g") {
+          if (this.onTitleSlide) {
+            this.commitField();
+            this.editField = "title";
+            this.input = this.readField(this.titleSlideNode);
+            this.inputCursor = 0;
+            this.visualAnchor = 0;
+            this.pendingEditOp = "";
+            this.pendingCtrlW = false;
+            this.textUndoStack = [];
+            this.textRedoStack = [];
+            this.statusMessage = `Navigating ${this.editFieldLabel} — h/l/j/k:Move  i/a:Insert  v:Visual  Tab:Field  Esc:Done  Enter:Next`;
+            this.statusIsError = false;
+            this.render();
+            return;
+          }
+          this.inputCursor = 0;
+          this.render();
+          return;
+        }
+      } else if (seq === "g") {
+        this.pendingVisualG = true;
         this.render();
         return;
       }
@@ -2075,6 +2685,10 @@ export class OutlineEditorTUI {
           break;
         case "j":
         case "down":
+          if (this.onTitleSlide) {
+            this.navigateFrontmatterField(1);
+            break;
+          }
           if (this.editingMultiline && info.line < info.lines.length - 1) {
             const nextLineStart = info.lineEnd + 1;
             const nextLineText = info.lines[info.line + 1];
@@ -2084,6 +2698,10 @@ export class OutlineEditorTUI {
           break;
         case "k":
         case "up":
+          if (this.onTitleSlide) {
+            this.navigateFrontmatterField(-1);
+            break;
+          }
           if (this.editingMultiline && info.line > 0) {
             const prevLineText = info.lines[info.line - 1];
             const prevLineStart = this.input.slice(0, info.lineStart - 1).lastIndexOf("\n") + 1;
@@ -2099,6 +2717,24 @@ export class OutlineEditorTUI {
         case "$":
         case "end":
           this.inputCursor = Math.max(info.lineStart, info.lineEnd > info.lineStart ? info.lineEnd - 1 : info.lineStart);
+          break;
+        case "G":
+          if (this.onTitleSlide) {
+            this.commitField();
+            this.editField = "conference";
+            this.input = this.readField(this.titleSlideNode);
+            this.inputCursor = Math.max(0, this.input.length - 1);
+            this.visualAnchor = this.inputCursor;
+            this.pendingEditOp = "";
+            this.pendingCtrlW = false;
+            this.pendingVisualG = false;
+            this.textUndoStack = [];
+            this.textRedoStack = [];
+            this.statusMessage = `Navigating ${this.editFieldLabel} — h/l/j/k:Move  i/a:Insert  v:Visual  Tab:Field  Esc/Enter:Done`;
+            this.statusIsError = false;
+            break;
+          }
+          this.inputCursor = Math.max(0, this.input.length - 1);
           break;
         case "w":
           this.inputCursor = this.findNextWordStart(this.input, this.inputCursor);
@@ -2256,6 +2892,10 @@ export class OutlineEditorTUI {
           this.pushTextUndo();
           this.input = this.input.slice(0, this.inputCursor) + "\n" + this.input.slice(this.inputCursor);
           this.inputCursor++;
+        } else if (this.onTitleSlide) {
+          if (!this.nextFrontmatterField(true)) {
+            this.finishEdit();
+          }
         } else {
           this.finishEdit();
         }
@@ -2436,9 +3076,9 @@ export class OutlineEditorTUI {
       this.pendingCtrlW = false;
       const token = normalKeyToken(key);
       if (token === "w" || token === "l" || key.name === "right") {
-        this.beginEdit("description");
+        this.beginEdit(this.onTitleSlide ? "subtitle" : "description");
       } else if (token === "j" || key.name === "down") {
-        this.beginEdit("notes");
+        this.beginEdit(this.onTitleSlide ? "subtitle" : "notes");
       } else if (token === "h" || key.name === "left") {
         this.beginEdit("title");
       }
@@ -2533,7 +3173,7 @@ export class OutlineEditorTUI {
           break;
         case "tab":
           if (this.onTitleSlide) {
-            this.beginEdit("title");
+            this.beginEdit("subtitle");
             break;
           }
           if (key.shift) this.dedentNode();
@@ -3064,11 +3704,11 @@ export class OutlineEditorTUI {
       : this.editField === "conference" ? "CONF"
       : "TITLE";
     if (this.mode === "EDIT_NORMAL") {
-      modeBadge = this.editingMultiline ? `\x1b[44;37m ${fieldTag}-NAV \x1b[0m` : "\x1b[44;37m EDIT-NAV \x1b[0m";
+      modeBadge = this.onTitleSlide ? `\x1b[44;37m ${fieldTag}-NAV \x1b[0m` : (this.editingMultiline ? `\x1b[44;37m ${fieldTag}-NAV \x1b[0m` : "\x1b[44;37m EDIT-NAV \x1b[0m");
     } else if (this.mode === "VISUAL") {
-      modeBadge = this.editingMultiline ? `\x1b[45;37m ${fieldTag}-VIS \x1b[0m` : "\x1b[45;37m EDIT-VIS \x1b[0m";
+      modeBadge = this.onTitleSlide ? `\x1b[45;37m ${fieldTag}-VIS \x1b[0m` : (this.editingMultiline ? `\x1b[45;37m ${fieldTag}-VIS \x1b[0m` : "\x1b[45;37m EDIT-VIS \x1b[0m");
     } else if (this.mode === "INSERT") {
-      modeBadge = this.editingMultiline ? `\x1b[45;37m ${fieldTag}-INS \x1b[0m` : "\x1b[43;30m INSERT \x1b[0m";
+      modeBadge = this.onTitleSlide ? `\x1b[45;37m ${fieldTag}-INS \x1b[0m` : (this.editingMultiline ? `\x1b[45;37m ${fieldTag}-INS \x1b[0m` : "\x1b[43;30m INSERT \x1b[0m");
     } else if (this.mode === "COMMAND") {
       modeBadge = "\x1b[46;30m COMMAND \x1b[0m";
     }
@@ -3129,50 +3769,7 @@ export class OutlineEditorTUI {
 
     const rightLines: string[] = [];
     if (this.onTitleSlide) {
-      const meta = this.outline.metadata;
-      rightLines.push(truncateToWidth("\x1b[1mType:\x1b[0m Frontmatter \x1b[2m(YAML)\x1b[0m", rightWidth, true));
-      const divider = `\x1b[2m${"─".repeat(rightWidth)}\x1b[0m`;
-      rightLines.push(divider);
-
-      const isEditing = this.mode === "EDIT_NORMAL" || this.mode === "INSERT" || this.mode === "VISUAL";
-      const fields: Array<{ key: EditField; label: string; value: string }> = [
-        { key: "title", label: "Title", value: meta.title },
-        { key: "subtitle", label: "Subtitle", value: meta.subtitle },
-        { key: "author", label: "Author", value: meta.author },
-        { key: "institute", label: "Author Org", value: meta.institute },
-        { key: "date", label: "Date", value: meta.date },
-        { key: "conference", label: "Conference", value: meta.conference },
-      ];
-
-      for (const field of fields) {
-        const active = isEditing && this.editField === field.key;
-        const prefix = active ? "\x1b[1;36m▶ \x1b[0m" : "  ";
-        const labelStr = active ? `\x1b[1;36m${field.label}:\x1b[0m ` : `\x1b[1m${field.label}:\x1b[0m `;
-        let valStr = "";
-        if (active) {
-          valStr = this.formatInlineEdit(this.input, this.inputCursor);
-        } else if (field.value) {
-          valStr = field.value;
-        } else {
-          valStr = "\x1b[2m(empty)\x1b[0m";
-        }
-        rightLines.push(truncateToWidth(`${prefix}${labelStr}${valStr}`, rightWidth, true));
-      }
-
-      if (meta.extraLines && meta.extraLines.length > 0) {
-        rightLines.push(truncateToWidth(`  \x1b[2m+ ${meta.extraLines.length} custom YAML lines preserved\x1b[0m`, rightWidth, true));
-      }
-
-      if (paneHeight > rightLines.length + 4) {
-        rightLines.push(divider);
-        rightLines.push("\x1b[1mPreview (YAML):\x1b[0m");
-        const fm = this.outline.getFrontmatter();
-        const fmLines = fm.split("\n");
-        const remainingSpace = paneHeight - rightLines.length;
-        for (let i = 0; i < Math.min(fmLines.length, remainingSpace); i++) {
-          rightLines.push(truncateToWidth(`\x1b[2m${fmLines[i]}\x1b[0m`, rightWidth, false));
-        }
-      }
+      rightLines.push(...this.renderFrontmatterFields(rightWidth, paneHeight));
     } else if (selected) {
       const metaLines: string[] = [];
       if (focused) {
@@ -3370,7 +3967,13 @@ export class OutlineEditorTUI {
         : Math.max(0, Math.min(this.inputCursor, echo.length));
       const cursorChar = cur < echo.length ? echo[cur] : " ";
       const displayLine = this.editingMultiline ? `[Line ${info.line + 1}/${info.lines.length}] ` : "";
-      const hint = nav ? "[h/l:Move w/b:Word v:Visual Tab:Pane Esc/Enter:Done]" : "[Esc: Nav Mode | Enter: Confirm]";
+      const hint = nav
+        ? (this.onTitleSlide
+            ? (this.editField === "conference" ? "[h/l/j/k:Move w/b:Word v:Visual Tab:Field Esc/Enter:Done]" : "[h/l/j/k:Move w/b:Word v:Visual Tab:Field Esc:Done Enter:EditNext]")
+            : (this.editingMultiline ? "[h/l/j/k:Move w/b:Word v:Visual Tab:Pane Esc/Enter:Done]" : "[h/l:Move w/b:Word v:Visual Tab:Pane Esc/Enter:Done]"))
+        : (this.onTitleSlide
+            ? (this.editField === "conference" ? "[Esc: Nav Mode | Enter: Confirm]" : "[Esc: Nav Mode | Enter: Next]")
+            : "[Esc: Nav Mode | Enter: Confirm]");
       const color = nav ? "\x1b[1;34m" : "\x1b[1;33m";
       statusLine = ` ${color}${promptLabel}\x1b[0m${displayLine}\x1b[1m${echo.slice(0, cur)}\x1b[7m${cursorChar}\x1b[0m\x1b[1m${echo.slice(cur + 1)}\x1b[0m \x1b[2m${hint}\x1b[0m`;
     } else if (this.mode === "COMMAND") {
@@ -3388,9 +3991,18 @@ export class OutlineEditorTUI {
     if (this.mode === "VISUAL") {
       footerHints = " y:Yank  d/x:Cut  c:Change  p:Paste  o:SwapCursor  w/b/e:Word  0/$:LineEnd  Tab:Pane  Esc:Cancel";
     } else if (this.mode === "EDIT_NORMAL") {
-      footerHints = " h/l:Move  w/b/e:Word  v/V:Visual  yw/yy:Yank  p/P:Paste  Tab:Pane  cw/de:Change  u:Undo  Esc:Done";
+      footerHints = this.onTitleSlide
+        ? (this.editField === "conference"
+            ? " h/l/j/k:Move  w/b/e:Word  v/V:Visual  yw/yy:Yank  p/P:Paste  Tab:Field  cw/de:Change  u:Undo  Esc/Enter:Done"
+            : " h/l/j/k:Move  w/b/e:Word  v/V:Visual  yw/yy:Yank  p/P:Paste  Tab:Field  Enter:EditNext  u:Undo  Esc:Done")
+        : (this.editingMultiline
+            ? " h/l/j/k:Move  w/b/e:Word  v/V:Visual  yw/yy:Yank  p/P:Paste  Tab:Pane  cw/de:Change  u:Undo  Esc:Done"
+            : " h/l:Move  w/b/e:Word  v/V:Visual  yw/yy:Yank  p/P:Paste  Tab:Pane  cw/de:Change  u:Undo  Esc:Done");
     } else if (this.mode === "INSERT") {
-      footerHints = ` Type to edit  BS:Delete  Ctrl+W:DelWord  Ctrl+U:DelLine  Esc:NavMode  Enter:${this.editingMultiline ? "Newline" : "Confirm"}`;
+      const enterHint = this.onTitleSlide
+        ? (this.editField === "conference" ? "Confirm" : "Next")
+        : (this.editingMultiline ? "Newline" : "Confirm");
+      footerHints = ` Type to edit  BS:Delete  Ctrl+W:DelWord  Ctrl+U:DelLine  Esc:NavMode  Enter:${enterHint}`;
     } else if (this.mode === "COMMAND") {
       footerHints = " Enter:Execute  Esc:Cancel  ↑/↓:History  ← →:Move";
     } else if (this.onTitleSlide) {
@@ -3425,7 +4037,7 @@ export class OutlineEditorTUI {
       "║    J / K          Reorder: move node down / up within siblings       ║",
       "║    Tab / >        Indent (demote)   Shift+Tab / <  Dedent (promote)  ║",
       "║    e / R / Enter  Edit title        i  Edit title → INSERT           ║",
-      "║    E / N          Edit content / notes (E: subtitle in frontmatter)  ║",
+      "║    E / N          Edit content / notes (E: subtitle in title slide)  ║",
       "║    v / V          Visual text selection on title                     ║",
       "║    yy / Y         Yank node title to clipboard                       ║",
       "║    p / P          Paste clipboard as new sibling below / above       ║",
@@ -3441,7 +4053,7 @@ export class OutlineEditorTUI {
       "║    p / P          Paste clipboard after / before cursor              ║",
       "║    Tab / S-Tab    Cycle pane / frontmatter field                     ║",
       "║    Ctrl+W w       Cycle pane;  Ctrl+W h/l/j/k direct pane jump       ║",
-      "║    j / k          Move by logical line (content / notes); a          ║",
+      "║    j / k          Move line (content/notes) / field (frontmatter)    ║",
       "║                   wrapped line is stepped over whole, as in vim      ║",
       "║    Esc / Enter    Confirm and return to NORMAL                       ║",
       "║    Editing content / notes expands the right-hand pane; the          ║",
@@ -3520,7 +4132,7 @@ export class OutlineEditorTUI {
     height: number,
     editing: boolean,
     emptyHint: string,
-    trackStructure: boolean
+    trackStructure: boolean | "yaml"
   ): { rows: string[]; above: number; below: number } {
     const empty = { rows: [] as string[], above: 0, below: 0 };
     if (height <= 0 || width <= 0) return empty;

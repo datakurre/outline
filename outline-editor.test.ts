@@ -4,6 +4,7 @@ import * as assert from "assert";
 import {
   OutlineEditorTUI,
   Outline,
+  validateFrontmatterYaml,
   computeMarkdownStyles,
   MD_CAUTION,
   MD_STRUCTURE,
@@ -970,6 +971,180 @@ async function runTests() {
       (editor as any).quit(true);
     });
 
+    await test("Vim j/k and down/up navigation between frontmatter fields", () => {
+      const editor = new OutlineEditorTUI(testFile);
+      editor.dispatchKey({ sequence: "g" });
+      editor.dispatchKey({ sequence: "g" });
+      assert.strictEqual(editor.isOnFrontmatter(), true);
+
+      // Begin edit on title with 'e'
+      editor.dispatchKey({ sequence: "e" });
+      assert.strictEqual(editor.getMode(), "EDIT_NORMAL");
+      assert.strictEqual(editor.getEditField(), "title");
+
+      // j moves to subtitle
+      editor.dispatchKey({ sequence: "j" });
+      assert.strictEqual(editor.getEditField(), "subtitle");
+
+      // j moves to author
+      editor.dispatchKey({ sequence: "j" });
+      assert.strictEqual(editor.getEditField(), "author");
+
+      // down moves to institute
+      editor.dispatchKey({ name: "down" });
+      assert.strictEqual(editor.getEditField(), "institute");
+
+      // down moves to date
+      editor.dispatchKey({ name: "down" });
+      assert.strictEqual(editor.getEditField(), "date");
+
+      // j moves to conference
+      editor.dispatchKey({ sequence: "j" });
+      assert.strictEqual(editor.getEditField(), "conference");
+
+      // j at bottom field stays on conference
+      editor.dispatchKey({ sequence: "j" });
+      assert.strictEqual(editor.getEditField(), "conference");
+
+      // k moves up to date
+      editor.dispatchKey({ sequence: "k" });
+      assert.strictEqual(editor.getEditField(), "date");
+
+      // up moves up to institute
+      editor.dispatchKey({ name: "up" });
+      assert.strictEqual(editor.getEditField(), "institute");
+
+      // k moves up to author
+      editor.dispatchKey({ sequence: "k" });
+      assert.strictEqual(editor.getEditField(), "author");
+
+      // k moves up to subtitle
+      editor.dispatchKey({ sequence: "k" });
+      assert.strictEqual(editor.getEditField(), "subtitle");
+
+      // k moves up to title
+      editor.dispatchKey({ sequence: "k" });
+      assert.strictEqual(editor.getEditField(), "title");
+
+      // k at top field stays on title
+      editor.dispatchKey({ sequence: "k" });
+      assert.strictEqual(editor.getEditField(), "title");
+
+      // G jumps to conference
+      editor.dispatchKey({ sequence: "G" });
+      assert.strictEqual(editor.getEditField(), "conference");
+
+      // gg jumps to title
+      editor.dispatchKey({ sequence: "g" });
+      editor.dispatchKey({ sequence: "g" });
+      assert.strictEqual(editor.getEditField(), "title");
+
+      (editor as any).quit(true);
+    });
+
+    await test("Enter on frontmatter item moves to following item and enters edit mode", () => {
+      const editor = new OutlineEditorTUI(testFile);
+      editor.dispatchKey({ sequence: "g" });
+      editor.dispatchKey({ sequence: "g" });
+      assert.strictEqual(editor.isOnFrontmatter(), true);
+
+      // Start editing title in INSERT mode with 'i'
+      editor.dispatchKey({ sequence: "i" });
+      assert.strictEqual(editor.getMode(), "INSERT");
+      assert.strictEqual(editor.getEditField(), "title");
+      for (const ch of "Slide Deck Title") editor.dispatchKey({ sequence: ch });
+
+      // Enter moves to subtitle and enters INSERT mode
+      editor.dispatchKey({ name: "return" });
+      assert.strictEqual(editor.getMode(), "INSERT");
+      assert.strictEqual(editor.getEditField(), "subtitle");
+      assert.strictEqual(editor.getMetadata().title, "Slide Deck Title");
+      for (const ch of "Architecture Overview") editor.dispatchKey({ sequence: ch });
+
+      // Enter moves to author and enters INSERT mode
+      editor.dispatchKey({ name: "return" });
+      assert.strictEqual(editor.getMode(), "INSERT");
+      assert.strictEqual(editor.getEditField(), "author");
+      assert.strictEqual(editor.getMetadata().subtitle, "Architecture Overview");
+      for (const ch of "Alice Engineer") editor.dispatchKey({ sequence: ch });
+
+      // Enter moves to institute and enters INSERT mode
+      editor.dispatchKey({ name: "return" });
+      assert.strictEqual(editor.getMode(), "INSERT");
+      assert.strictEqual(editor.getEditField(), "institute");
+      assert.strictEqual(editor.getMetadata().author, "Alice Engineer");
+      for (const ch of "Tech Org") editor.dispatchKey({ sequence: ch });
+
+      // Enter moves to date and enters INSERT mode
+      editor.dispatchKey({ name: "return" });
+      assert.strictEqual(editor.getMode(), "INSERT");
+      assert.strictEqual(editor.getEditField(), "date");
+      assert.strictEqual(editor.getMetadata().institute, "Tech Org");
+      for (const ch of "2026-09-07") editor.dispatchKey({ sequence: ch });
+
+      // Enter moves to conference and enters INSERT mode
+      editor.dispatchKey({ name: "return" });
+      assert.strictEqual(editor.getMode(), "INSERT");
+      assert.strictEqual(editor.getEditField(), "conference");
+      assert.strictEqual(editor.getMetadata().date, "2026-09-07");
+      for (const ch of "Global Summit") editor.dispatchKey({ sequence: ch });
+
+      // Enter on final field (conference) confirms and returns to NORMAL mode
+      editor.dispatchKey({ name: "return" });
+      assert.strictEqual(editor.getMode(), "NORMAL");
+      assert.strictEqual(editor.getMetadata().conference, "Global Summit");
+      assert.strictEqual(editor.isModified(), true);
+
+      // Verify Enter from EDIT_NORMAL mode also moves to following item in edit mode
+      editor.dispatchKey({ sequence: "e" });
+      assert.strictEqual(editor.getMode(), "EDIT_NORMAL");
+      assert.strictEqual(editor.getEditField(), "title");
+
+      editor.dispatchKey({ name: "return" });
+      assert.strictEqual(editor.getMode(), "INSERT");
+      assert.strictEqual(editor.getEditField(), "subtitle");
+
+      editor.dispatchKey({ name: "escape" });
+      assert.strictEqual(editor.getMode(), "EDIT_NORMAL");
+      assert.strictEqual(editor.getEditField(), "subtitle");
+
+      editor.dispatchKey({ name: "return" });
+      assert.strictEqual(editor.getMode(), "INSERT");
+      assert.strictEqual(editor.getEditField(), "author");
+
+      (editor as any).quit(true);
+    });
+
+    await test("Frontmatter: Ctrl+W pane navigation between title and subtitle", () => {
+      const editor = new OutlineEditorTUI(testFile);
+      editor.dispatchKey({ sequence: "g" });
+      editor.dispatchKey({ sequence: "g" });
+      editor.dispatchKey({ sequence: "e" });
+      assert.strictEqual(editor.getEditField(), "title");
+
+      // Ctrl+W then l moves to subtitle
+      editor.dispatchKey({ ctrl: true, name: "w" });
+      editor.dispatchKey({ sequence: "l" });
+      assert.strictEqual(editor.getEditField(), "subtitle");
+
+      // Ctrl+W then h moves back to title
+      editor.dispatchKey({ ctrl: true, name: "w" });
+      editor.dispatchKey({ sequence: "h" });
+      assert.strictEqual(editor.getEditField(), "title");
+
+      // Ctrl+W then j moves to next field (subtitle)
+      editor.dispatchKey({ ctrl: true, name: "w" });
+      editor.dispatchKey({ sequence: "j" });
+      assert.strictEqual(editor.getEditField(), "subtitle");
+
+      // Ctrl+W then k moves back to previous field (title)
+      editor.dispatchKey({ ctrl: true, name: "w" });
+      editor.dispatchKey({ sequence: "k" });
+      assert.strictEqual(editor.getEditField(), "title");
+
+      (editor as any).quit(true);
+    });
+
     await test("Frontmatter: 'd' clears metadata and 'u' restores it via undo", () => {
       const fmFile = path.resolve("./test-title-slide.md");
       fs.writeFileSync(fmFile, "---\ntitle: Deck Title\nauthor: Alice\nconference: Conf 2026\n---\n\n# Slide 1\n");
@@ -1043,6 +1218,107 @@ async function runTests() {
       assert.strictEqual(editor.isOnFrontmatter(), true);
       assert.strictEqual((editor as any).titleSlideNode.title, "Frontmatter");
       (editor as any).quit(true);
+    });
+
+    await test("validateFrontmatterYaml comprehensive syntax rules", () => {
+      // Valid YAML cases
+      assert.strictEqual(validateFrontmatterYaml("").valid, true);
+      assert.strictEqual(validateFrontmatterYaml("title: Hello World\nauthor: Alice").valid, true);
+      assert.strictEqual(validateFrontmatterYaml('title: "Double \\"Quote\\""').valid, true);
+      assert.strictEqual(validateFrontmatterYaml("title: 'Single ''Quote'''").valid, true);
+      assert.strictEqual(validateFrontmatterYaml("items:\n  - one\n  - two").valid, true);
+      assert.strictEqual(validateFrontmatterYaml("flow: [a, b, c]").valid, true);
+      assert.strictEqual(validateFrontmatterYaml("desc: |\n  Line 1\n  Line 2").valid, true);
+      assert.strictEqual(validateFrontmatterYaml("# comment\ntitle: test # inline comment").valid, true);
+
+      // Invalid: Unterminated double quote
+      const r1 = validateFrontmatterYaml('title: "unterminated');
+      assert.strictEqual(r1.valid, false);
+      assert.ok(r1.error?.includes("unterminated double quote"));
+
+      // Invalid: Unterminated single quote
+      const r2 = validateFrontmatterYaml("title: 'unterminated");
+      assert.strictEqual(r2.valid, false);
+      assert.ok(r2.error?.includes("unterminated single quote"));
+
+      // Invalid: Tabs in indentation
+      const r3 = validateFrontmatterYaml("\ttitle: test");
+      assert.strictEqual(r3.valid, false);
+      assert.ok(r3.error?.includes("tabs are not allowed for indentation"));
+
+      // Invalid: Missing colon in mapping
+      const r4 = validateFrontmatterYaml("invalid mapping line without colon");
+      assert.strictEqual(r4.valid, false);
+      assert.ok(r4.error?.includes("missing ':' in mapping"));
+
+      // Invalid: Unquoted value containing ': '
+      const r5 = validateFrontmatterYaml("title: unquoted: bad");
+      assert.strictEqual(r5.valid, false);
+      assert.ok(r5.error?.includes("unquoted value containing ': '"));
+
+      // Invalid: Unclosed flow bracket
+      const r6 = validateFrontmatterYaml("tags: [a, b, c");
+      assert.strictEqual(r6.valid, false);
+      assert.ok(r6.error?.includes("unclosed '['"));
+    });
+
+    await test("Frontmatter fields render with soft-wrapping and vertical navigation across wrapped rows", () => {
+      const longTitle = "A Very Long Presentation Title That Exceeds The Width Of The Terminal Pane And Should Wrap Gracefully";
+      const longSubtitle = "Subtitle describing advanced systems architecture with multiple lines of important technical details";
+      const fmContent = `---\ntitle: ${longTitle}\nsubtitle: ${longSubtitle}\nauthor: Dr. Researcher\n---\n\n# Slide 1\n`;
+      const fmFile = path.resolve("./test-frontmatter-wrap.md");
+      fs.writeFileSync(fmFile, fmContent);
+
+      try {
+        const editor = new OutlineEditorTUI(fmFile);
+        assert.strictEqual(editor.isOnFrontmatter(), true);
+        assert.strictEqual(editor.getMetadata().title, longTitle);
+        assert.strictEqual(editor.getMetadata().subtitle, longSubtitle);
+
+        // Render frontmatter fields: verify rendered lines wrap with continuation indent
+        const rendered = (editor as any).renderFrontmatterFields(40, 25);
+        assert.ok(rendered.length > 8, "Rendered output should have wrapped lines");
+        // Check that title wraps and continuation lines start with "    "
+        const titleContLines = rendered.filter((line: string) => line.startsWith("    "));
+        assert.ok(titleContLines.length >= 2, "Should have continuation lines with 4-space indent");
+
+        // Begin edit on title with 'e'
+        editor.dispatchKey({ sequence: "e" });
+        assert.strictEqual(editor.getMode(), "EDIT_NORMAL");
+        assert.strictEqual(editor.getEditField(), "title");
+        // Single line titles open at end of line; press '0' to move to start of title
+        editor.dispatchKey({ sequence: "0" });
+        assert.strictEqual(editor.getInputCursor(), 0);
+
+        // Long title wraps across multiple visual rows. Moving 'j' moves to next wrapped row in title
+        editor.dispatchKey({ sequence: "j" });
+        assert.strictEqual(editor.getEditField(), "title");
+        assert.ok(editor.getInputCursor() > 0, "j should advance cursor within long wrapped title");
+
+        const curRow2 = editor.getInputCursor();
+        editor.dispatchKey({ sequence: "j" });
+        assert.strictEqual(editor.getEditField(), "title");
+        assert.ok(editor.getInputCursor() > curRow2, "j should advance cursor further within long wrapped title");
+
+        // Move up with 'k'
+        editor.dispatchKey({ sequence: "k" });
+        assert.strictEqual(editor.getEditField(), "title");
+        assert.strictEqual(editor.getInputCursor(), curRow2, "k should move cursor back to previous wrapped row");
+
+        // Move back to row 0
+        editor.dispatchKey({ sequence: "k" });
+        assert.strictEqual(editor.getInputCursor(), 0);
+
+        // Move down all the way through title wrapped rows until subtitle
+        while (editor.getEditField() === "title") {
+          editor.dispatchKey({ sequence: "j" });
+        }
+        assert.strictEqual(editor.getEditField(), "subtitle");
+
+        (editor as any).quit(true);
+      } finally {
+        if (fs.existsSync(fmFile)) fs.unlinkSync(fmFile);
+      }
     });
 
   } finally {
